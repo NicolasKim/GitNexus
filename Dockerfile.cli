@@ -21,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3 make g+
 
 # Build gitnexus-shared first - gitnexus depends on it as a workspace.
 COPY gitnexus-shared/package.json gitnexus-shared/package-lock.json ./gitnexus-shared/
-RUN npm ci --prefix gitnexus-shared
+# Skip onnxruntime-node native binaries (Voyage HTTP embeddings; no GPU on 172).
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --prefix gitnexus-shared
 COPY gitnexus-shared ./gitnexus-shared
 RUN rm -f gitnexus-shared/tsconfig.tsbuildinfo
 RUN npm run build --prefix gitnexus-shared
@@ -31,7 +32,7 @@ RUN npm run build --prefix gitnexus-shared
 # tree-sitter-proto) and `prepare` (compiles TypeScript via scripts/build.js),
 # both of which need the source tree.
 COPY gitnexus ./gitnexus
-RUN npm ci --prefix gitnexus
+RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --prefix gitnexus
 
 # Drop dev dependencies for a smaller runtime layer.
 RUN npm prune --omit=dev --prefix gitnexus

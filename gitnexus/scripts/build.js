@@ -35,6 +35,13 @@ function getBuildTimeoutMs() {
 
 const BUILD_TIMEOUT_MS = getBuildTimeoutMs();
 
+/** Rolldown (Vite 8) ships platform bindings as optionalDependencies; partial installs often omit them. */
+function webNativeBindingsMissing(webRoot) {
+  const rolldownScope = path.join(webRoot, 'node_modules', '@rolldown');
+  if (!fs.existsSync(rolldownScope)) return true;
+  return !fs.readdirSync(rolldownScope).some((name) => name.startsWith('binding-'));
+}
+
 // Published-package guard: when installed from the npm registry the
 // monorepo sibling `gitnexus-shared` does not exist and `dist/` is
 // already pre-built. Skip the build to avoid a misleading ENOENT
@@ -53,10 +60,18 @@ if (!fs.existsSync(SHARED_ROOT)) {
 
 // ── 1. Build gitnexus-shared ───────────────────────────────────────
 console.log('[build] compiling gitnexus-shared…');
+// Resolve tsc from gitnexus (not cwd): shared package has no local node_modules on fresh install.
 const tscCmd =
   process.platform === 'win32'
-    ? path.join('node_modules', '.bin', 'tsc.cmd')
-    : path.join('node_modules', '.bin', 'tsc');
+    ? path.join(ROOT, 'node_modules', '.bin', 'tsc.cmd')
+    : path.join(ROOT, 'node_modules', '.bin', 'tsc');
+if (!fs.existsSync(tscCmd)) {
+  console.error(
+    `[build] TypeScript compiler not found at ${tscCmd}.\n` +
+      'Run `npm install` in gitnexus/ first (typescript is a devDependency).',
+  );
+  process.exit(1);
+}
 execSync(tscCmd, { cwd: SHARED_ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
 
 // ── 2. Build gitnexus ──────────────────────────────────────────────
@@ -111,17 +126,35 @@ const WEB_ROOT = path.resolve(ROOT, '..', 'gitnexus-web');
 const WEB_DEST = path.join(DIST, '..', 'web');
 
 if (fs.existsSync(path.join(WEB_ROOT, 'package.json'))) {
-  console.log('[build] building gitnexus-web…');
-  if (!fs.existsSync(path.join(WEB_ROOT, 'node_modules'))) {
-    console.log('[build] installing gitnexus-web dependencies…');
-    execSync('npm ci', { cwd: WEB_ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
-  }
-  execSync('npm run build', { cwd: WEB_ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
+  const skipWeb =
+    process.env.GITNEXUS_SKIP_WEB_BUILD === '1' || process.env.GITNEXUS_SKIP_WEB_BUILD === 'true';
+  if (skipWeb) {
+    console.log('[build] skipping web UI (GITNEXUS_SKIP_WEB_BUILD is set).');
+  } else {
+    console.log('[build] building gitnexus-web…');
+    const webNodeModules = path.join(WEB_ROOT, 'node_modules');
+    if (!fs.existsSync(webNodeModules) || webNativeBindingsMissing(WEB_ROOT)) {
+      if (fs.existsSync(webNodeModules) && webNativeBindingsMissing(WEB_ROOT)) {
+        console.log(
+          '[build] gitnexus-web node_modules is incomplete (missing rolldown native binding); running npm ci…',
+        );
+      } else {
+        console.log('[build] installing gitnexus-web dependencies…');
+      }
+      // Rolldown/Vite platform bindings are optionalDependencies; plain `npm ci` often omits them (npm/cli#4828).
+      execSync('npm ci --include=optional', {
+        cwd: WEB_ROOT,
+        stdio: 'inherit',
+        timeout: BUILD_TIMEOUT_MS,
+      });
+    }
+    execSync('npm run build', { cwd: WEB_ROOT, stdio: 'inherit', timeout: BUILD_TIMEOUT_MS });
 
-  // Copy dist → gitnexus/web/ (shipped in the npm package)
-  fs.rmSync(WEB_DEST, { recursive: true, force: true });
-  fs.cpSync(path.join(WEB_ROOT, 'dist'), WEB_DEST, { recursive: true });
-  console.log('[build] copied web UI → gitnexus/web/');
+    // Copy dist → gitnexus/web/ (shipped in the npm package)
+    fs.rmSync(WEB_DEST, { recursive: true, force: true });
+    fs.cpSync(path.join(WEB_ROOT, 'dist'), WEB_DEST, { recursive: true });
+    console.log('[build] copied web UI → gitnexus/web/');
+  }
 } else {
   console.log('[build] skipping web UI (gitnexus-web not found)');
 }

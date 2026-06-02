@@ -13,11 +13,12 @@
 
 import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
-const HTTP_TIMEOUT_MS = 30_000;
+// Tuned for remote Voyage / large-repo embedding (matches 172 production).
+const HTTP_TIMEOUT_MS = 120_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
-const HTTP_BATCH_SIZE = 64;
-const DEFAULT_DIMS = 384;
+const HTTP_BATCH_SIZE = 256;
+const DEFAULT_DIMS = 1024;
 const HTTP_BREAKER_KEY = 'embeddings-http';
 
 interface HttpConfig {
@@ -110,12 +111,22 @@ const httpEmbedBatch = async (
   batchIndex = 0,
   dimensions?: number,
 ): Promise<EmbeddingItem[]> => {
-  const requestBody: { input: string[]; model: string; dimensions?: number } = {
+  const isVoyageAi = url.includes('voyageai.com');
+  const requestBody: {
+    input: string[];
+    model: string;
+    dimensions?: number;
+    output_dimension?: number;
+  } = {
     input: batch,
     model,
   };
   if (dimensions !== undefined) {
-    requestBody.dimensions = dimensions;
+    if (isVoyageAi) {
+      requestBody.output_dimension = dimensions;
+    } else {
+      requestBody.dimensions = dimensions;
+    }
   }
 
   let resp: Response;
