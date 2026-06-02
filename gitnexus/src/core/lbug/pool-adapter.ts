@@ -132,7 +132,7 @@ const MAX_POOL_SIZE = 5;
 /** Idle timeout before closing a repo's connections */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 /** Max connections per repo (caps concurrent queries per repo) */
-const MAX_CONNS_PER_REPO = 8;
+const MAX_CONNS_PER_REPO = 16;
 
 let idleTimer: ReturnType<typeof setInterval> | null = null;
 

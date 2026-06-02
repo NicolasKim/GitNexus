@@ -6,8 +6,13 @@
 ROOT="$(git rev-parse --show-toplevel)"
 
 # 1. Format staged files with prettier via lint-staged
+LINT_STAGED="$ROOT/node_modules/.bin/lint-staged"
+if [ ! -x "$LINT_STAGED" ]; then
+  echo "pre-commit: lint-staged not found. Run: cd \"$ROOT\" && npm install"
+  exit 1
+fi
 echo "pre-commit: formatting staged files..."
-"$ROOT/node_modules/.bin/lint-staged" || exit 1
+"$LINT_STAGED" || exit 1
 
 # 2. Typecheck changed packages
 WEB_CHANGED=$(git diff --cached --name-only -- 'gitnexus-web/' | head -1)
@@ -19,6 +24,12 @@ if [ -n "$WEB_CHANGED" ]; then
 fi
 
 if [ -n "$CLI_CHANGED" ]; then
+  if [ ! -f "$ROOT/gitnexus-shared/dist/index.d.ts" ]; then
+    echo "pre-commit: gitnexus-shared not built. Run:"
+    echo "  cd \"$ROOT/gitnexus-shared\" && npm ci && npm run build"
+    echo "  cd \"$ROOT/gitnexus\" && ONNXRUNTIME_NODE_INSTALL=skip npm ci   # Node >= 22"
+    exit 1
+  fi
   echo "pre-commit: typechecking gitnexus..."
   cd "$ROOT/gitnexus" && ./node_modules/.bin/tsc --noEmit || exit 1
 fi
