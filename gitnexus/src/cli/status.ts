@@ -35,6 +35,9 @@ export const statusCommand = async () => {
   const isUpToDate = currentCommit === repo.meta.lastCommit;
 
   console.log(`${t('status.repository')}: ${repo.repoPath}`);
+  if (repo.meta.description) {
+    console.log(`${t('status.description')}: ${repo.meta.description}`);
+  }
   console.log(`${t('status.indexed')}: ${new Date(repo.meta.indexedAt).toLocaleString()}`);
   console.log(`${t('status.indexedCommit')}: ${repo.meta.lastCommit?.slice(0, 7)}`);
   console.log(`${t('status.currentCommit')}: ${currentCommit?.slice(0, 7)}`);

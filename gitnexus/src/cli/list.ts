@@ -38,6 +38,9 @@ export const listCommand = async () => {
     console.log(`    ${t('common.path')}:    ${entry.path}`);
     console.log(`    ${t('list.indexed')}: ${indexedDate}`);
     console.log(`    ${t('list.commit')}:  ${commitShort}`);
+    if (entry.description) {
+      console.log(`    ${t('list.description')}: ${entry.description}`);
+    }
     console.log(
       `    ${t('list.stats')}:   ${t('list.statsValue', {
         files: stats.files ?? 0,

@@ -13,7 +13,12 @@ import cors from 'cors';
 import path from 'path';
 import fs from 'fs/promises';
 import { createRequire } from 'node:module';
-import { loadMeta, listRegisteredRepos, getStoragePath } from '../storage/repo-manager.js';
+import {
+  loadMeta,
+  listRegisteredRepos,
+  getStoragePath,
+  updateRepoDescription,
+} from '../storage/repo-manager.js';
 import {
   executeQuery,
   executePrepared,
@@ -902,6 +907,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           path: r.path,
           indexedAt: r.indexedAt,
           lastCommit: r.lastCommit,
+          description: r.description,
           stats: r.stats,
         })),
       );
@@ -930,10 +936,54 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         name: entry.name,
         repoPath: entry.path,
         indexedAt: meta?.indexedAt ?? entry.indexedAt,
+        description: meta?.description ?? entry.description,
         stats: meta?.stats ?? entry.stats ?? {},
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get repo info' });
+    }
+  });
+
+  // Update repo business description without re-running analysis
+  app.patch('/api/repo/description', createRouteLimiter(), async (req, res) => {
+    try {
+      const repoName = requestedRepo(req);
+      if (!repoName) {
+        res.status(400).json({ error: 'Missing repo name (query param ?repo= or body.repo)' });
+        return;
+      }
+
+      const { description } = req.body ?? {};
+      if (typeof description !== 'string' || !description.trim()) {
+        res.status(400).json({ error: '"description" must be a non-empty string' });
+        return;
+      }
+
+      const entry = await resolveRepo(repoName);
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      const lockKey = getStoragePath(entry.path);
+      const lockErr = acquireRepoLock(lockKey);
+      if (lockErr) {
+        res.status(409).json({ error: lockErr });
+        return;
+      }
+
+      try {
+        const trimmed = description.trim();
+        const name = await updateRepoDescription(entry.path, trimmed);
+        await backend.init().catch(() => {});
+        res.json({ name, description: trimmed });
+      } finally {
+        releaseRepoLock(lockKey);
+      }
+    } catch (err: any) {
+      res
+        .status(statusFromError(err))
+        .json({ error: err.message || 'Failed to update description' });
     }
   });
 
@@ -1430,7 +1480,14 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // POST /api/analyze — start a new analysis job
   app.post('/api/analyze', createRouteLimiter({ limit: 10 }), async (req, res) => {
     try {
-      const { url: repoUrl, path: repoLocalPath, force, embeddings, dropEmbeddings } = req.body;
+      const {
+        url: repoUrl,
+        path: repoLocalPath,
+        force,
+        embeddings,
+        dropEmbeddings,
+        description,
+      } = req.body;
 
       // Input type validation
       if (repoUrl !== undefined && typeof repoUrl !== 'string') {
@@ -1439,6 +1496,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
       if (repoLocalPath !== undefined && typeof repoLocalPath !== 'string') {
         res.status(400).json({ error: '"path" must be a string' });
+        return;
+      }
+      if (description !== undefined && typeof description !== 'string') {
+        res.status(400).json({ error: '"description" must be a string' });
         return;
       }
 
@@ -1628,6 +1689,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 force: !!force,
                 embeddings: !!embeddings,
                 dropEmbeddings: !!dropEmbeddings,
+                ...(typeof description === 'string' && description.trim()
+                  ? { description: description.trim() }
+                  : {}),
               },
             });
           };

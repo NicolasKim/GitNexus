@@ -41,6 +41,7 @@ import {
   registerRepo,
   cleanupOldKuzuFiles,
   INCREMENTAL_SCHEMA_VERSION,
+  type RepoMeta,
 } from '../storage/repo-manager.js';
 import { computeFileHashes, diffFileHashes } from '../storage/file-hash.js';
 import {
@@ -137,6 +138,11 @@ export interface AnalyzeOptions {
    * of a pipeline re-index.
    */
   allowDuplicateName?: boolean;
+  /**
+   * User-provided business description for the repository. When set during
+   * analyze, persisted to meta.json and the global registry.
+   */
+  description?: string;
   /**
    * Worker pool size override, threaded from the CLI `--workers` flag.
    * Forwarded to `PipelineOptions.workerPoolSize` so the parse phase
@@ -389,6 +395,17 @@ export async function runFullAnalysis(
       })();
       if (!dirty) {
         await ensureGitNexusIgnored(repoPath);
+        if (options.description !== undefined) {
+          const trimmed = options.description.trim();
+          if (trimmed) {
+            const updatedMeta: RepoMeta = { ...existingMeta, description: trimmed };
+            await saveMeta(storagePath, updatedMeta);
+            await registerRepo(repoPath, updatedMeta, {
+              name: options.registryName,
+              allowDuplicateName: options.allowDuplicateName,
+            });
+          }
+        }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
           // canonical repo basename (#1259) but leaves arbitrary subdirs
@@ -945,6 +962,10 @@ export async function runFullAnalysis(
       // origin remote, which is fine: paths-only repos behave as
       // before.
       remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      description:
+        options.description !== undefined
+          ? options.description.trim() || undefined
+          : existingMeta?.description,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,

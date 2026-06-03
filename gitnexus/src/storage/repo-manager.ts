@@ -64,6 +64,8 @@ export interface RepoMeta {
    * treated as path-only and sibling-clone detection is skipped.
    */
   remoteUrl?: string;
+  /** User-provided business description for the repository (from Loom RAG / analyze API). */
+  description?: string;
   stats?: {
     files?: number;
     nodes?: number;
@@ -125,6 +127,8 @@ export interface RegistryEntry {
   lastCommit: string;
   /** See {@link RepoMeta.remoteUrl}. Mirrored from meta at register time. */
   remoteUrl?: string;
+  /** See {@link RepoMeta.description}. Mirrored from meta at register time. */
+  description?: string;
   stats?: RepoMeta['stats'];
 }
 
@@ -604,6 +608,9 @@ export const registerRepo = async (
     indexedAt: meta.indexedAt,
     lastCommit: meta.lastCommit,
     remoteUrl: meta.remoteUrl,
+    // Preserve an existing registry description when meta omits the field
+    // (older meta.json, or partial writes). Field stays optional throughout.
+    description: meta.description ?? existing?.description,
     stats: meta.stats,
   };
 
@@ -615,6 +622,31 @@ export const registerRepo = async (
 
   await writeRegistry(entries);
   return name;
+};
+
+/**
+ * Update the user-provided business description for an indexed repo.
+ * Persists to both meta.json and the global registry without re-running analysis.
+ */
+export const updateRepoDescription = async (
+  repoPath: string,
+  description: string,
+): Promise<string> => {
+  const trimmed = description.trim();
+  if (!trimmed) {
+    throw new Error('description cannot be empty');
+  }
+
+  const resolved = path.resolve(repoPath);
+  const { storagePath } = getStoragePaths(resolved);
+  const meta = await loadMeta(storagePath);
+  if (!meta) {
+    throw new Error(`No index found for ${resolved}. Run analyze first.`);
+  }
+
+  const updatedMeta: RepoMeta = { ...meta, description: trimmed };
+  await saveMeta(storagePath, updatedMeta);
+  return registerRepo(resolved, updatedMeta);
 };
 
 /**

@@ -16,6 +16,9 @@ import {
   readRegistry,
   loadCLIConfig,
   registerRepo,
+  updateRepoDescription,
+  saveMeta,
+  loadMeta,
   listRegisteredRepos,
   resolveRegistryEntry,
   canonicalizePath,
@@ -1104,5 +1107,80 @@ describe('registerRepo worktree-aware basename fallback (#1259)', () => {
     // collapse does.
     expect(entries[0].name).toBe('arbitrary-subdir');
     expect(entries[0].name).not.toBe(path.basename(tmpRepo.dbPath));
+  });
+});
+
+describe('repo description persistence', () => {
+  let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
+  let savedGitnexusHome: string | undefined;
+
+  const meta: RepoMeta = {
+    repoPath: '',
+    lastCommit: 'abc1234',
+    indexedAt: '2026-04-18T12:00:00.000Z',
+    stats: { files: 1, nodes: 1 },
+  };
+
+  beforeEach(async () => {
+    tmpHome = await createTempDir('gitnexus-desc-home-');
+    tmpRepo = await createTempDir('gitnexus-desc-repo-');
+    savedGitnexusHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = tmpHome.dbPath;
+
+    const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+    await saveMeta(storagePath, { ...meta, repoPath: tmpRepo.dbPath });
+  });
+
+  afterEach(async () => {
+    if (savedGitnexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = savedGitnexusHome;
+    await tmpHome.cleanup();
+    await tmpRepo.cleanup();
+  });
+
+  it('registerRepo mirrors description to registry', async () => {
+    await registerRepo(tmpRepo.dbPath, {
+      ...meta,
+      repoPath: tmpRepo.dbPath,
+      description: '司机服务后端仓库',
+    });
+
+    const entries = await readRegistry();
+    expect(entries).toHaveLength(1);
+    expect(entries[0].description).toBe('司机服务后端仓库');
+  });
+
+  it('updateRepoDescription updates meta.json and registry', async () => {
+    await registerRepo(tmpRepo.dbPath, { ...meta, repoPath: tmpRepo.dbPath });
+
+    await updateRepoDescription(tmpRepo.dbPath, '  更新后的说明  ');
+
+    const { storagePath } = getStoragePaths(tmpRepo.dbPath);
+    const stored = await loadMeta(storagePath);
+    expect(stored?.description).toBe('更新后的说明');
+
+    const entries = await readRegistry();
+    expect(entries[0].description).toBe('更新后的说明');
+  });
+
+  it('updateRepoDescription rejects empty string', async () => {
+    await registerRepo(tmpRepo.dbPath, { ...meta, repoPath: tmpRepo.dbPath });
+    await expect(updateRepoDescription(tmpRepo.dbPath, '   ')).rejects.toThrow(
+      'description cannot be empty',
+    );
+  });
+
+  it('registerRepo preserves existing registry description when meta omits it', async () => {
+    await registerRepo(tmpRepo.dbPath, {
+      ...meta,
+      repoPath: tmpRepo.dbPath,
+      description: '已有说明',
+    });
+
+    await registerRepo(tmpRepo.dbPath, { ...meta, repoPath: tmpRepo.dbPath });
+
+    const entries = await readRegistry();
+    expect(entries[0].description).toBe('已有说明');
   });
 });
