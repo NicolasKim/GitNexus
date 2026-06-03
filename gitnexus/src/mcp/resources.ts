@@ -280,6 +280,9 @@ async function getReposResource(backend: LocalBackend): Promise<string> {
   for (const repo of repos) {
     lines.push(`  - name: "${repo.name}"`);
     lines.push(`    path: "${repo.path}"`);
+    if (repo.description) {
+      lines.push(`    description: "${repo.description.replace(/"/g, '\\"')}"`);
+    }
     lines.push(`    indexed: "${repo.indexedAt}"`);
     lines.push(`    commit: "${repo.lastCommit?.slice(0, 7) || 'unknown'}"`);
     if (repo.stats) {
@@ -319,6 +322,10 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
     : { isStale: false, commitsBehind: 0 };
 
   const lines: string[] = [`project: ${context.projectName}`];
+
+  if (repo.description) {
+    lines.push(`description: "${repo.description.replace(/"/g, '\\"')}"`);
+  }
 
   if (staleness.isStale && staleness.hint) {
     lines.push('');

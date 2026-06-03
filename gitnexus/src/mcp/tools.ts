@@ -56,7 +56,7 @@ export const GITNEXUS_TOOLS: ToolDefinition[] = [
     name: 'list_repos',
     description: `List all indexed repositories available to GitNexus.
 
-Returns each repo's name, path, indexed date, last commit, and stats.
+Returns each repo's name, path, optional business description, indexed date, last commit, and stats.
 
 WHEN TO USE: First step when multiple repos are indexed, or to discover available repos.
 AFTER THIS: READ gitnexus://repo/{name}/context for the repo you want to work with.
