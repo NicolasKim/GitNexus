@@ -35,9 +35,10 @@ import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
+import { mountToolRoutes } from './tool-routes.js';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { JobManager } from './analyze-job.js';
+import { JobManager, JOB_TIMEOUT_MS } from './analyze-job.js';
 import { assertString, escapeRegExp, BadRequestError, createRouteLimiter } from './validation.js';
 import { extractRepoName, getCloneDir, cloneOrPull } from './git-clone.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
@@ -1782,18 +1783,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         progress: { phase: 'analyzing', percent: 0, message: 'Starting embedding generation...' },
       });
 
-      // 30-minute timeout for embedding jobs (same as analyze jobs)
-      const EMBED_TIMEOUT_MS = 30 * 60 * 1000;
       const embedTimeout = setTimeout(() => {
         const current = embedJobManager.getJob(job.id);
         if (current && current.status !== 'complete' && current.status !== 'failed') {
           releaseRepoLock(repoLockPath);
           embedJobManager.updateJob(job.id, {
             status: 'failed',
-            error: 'Embedding timed out (30 minute limit)',
+            error: 'Embedding timed out (4 hour limit)',
           });
         }
-      }, EMBED_TIMEOUT_MS);
+      }, JOB_TIMEOUT_MS);
 
       // Run embedding pipeline asynchronously
       (async () => {
@@ -1911,6 +1910,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     embedJobManager.cancelJob(req.params.jobId, 'Cancelled by user');
     res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
   });
+
+  // REST Tool Gateway — MCP tools over HTTP (does not modify existing routes)
+  mountToolRoutes(app, backend);
 
   // ── Web UI (served at root) ───────────────────────────────────────
 
