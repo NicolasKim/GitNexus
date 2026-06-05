@@ -46,12 +46,19 @@ RUN ONNXRUNTIME_NODE_INSTALL=skip npm ci --prefix gitnexus
 # Drop dev dependencies for a smaller runtime layer.
 RUN npm prune --omit=dev --prefix gitnexus
 
+# Re-materialize vendored grammars removed by prune (swift/proto/dart are not
+# listed in package.json dependencies but are required at analyze runtime).
+RUN node gitnexus/scripts/materialize-vendor-grammars.cjs \
+    && node gitnexus/scripts/build-tree-sitter-dart.cjs \
+    && node gitnexus/scripts/build-tree-sitter-proto.cjs \
+    && node gitnexus/scripts/build-tree-sitter-swift.cjs
+
 # -- Runtime -----------------------------------------------------------
 # node:22-bookworm-slim
 FROM node:22-bookworm-slim@sha256:9f6d5975c7dca860947d3915877f85607946403fc55349f39b4bc3688448bb6e AS runtime
 
 # curl for the healthcheck; git for cloning; ca-certificates for TLS verification.
-RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates && rm -rf /var/lib/apt/lists/* \
+RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates ripgrep && rm -rf /var/lib/apt/lists/* \
     && rm -rf /usr/local/lib/node_modules/npm \
     && rm -rf /usr/local/lib/node_modules/corepack \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack

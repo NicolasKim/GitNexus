@@ -35,7 +35,7 @@ export interface AnalyzeJob {
 
 const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-const JOB_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+export const JOB_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 export class JobManager {
   private jobs = new Map<string, AnalyzeJob>();
@@ -124,11 +124,10 @@ export class JobManager {
   registerChild(jobId: string, child: ChildProcess) {
     this.children.set(jobId, child);
 
-    // 30-minute timeout
     const timer = setTimeout(() => {
       const job = this.jobs.get(jobId);
       if (job && !this.isTerminal(job.status)) {
-        this.cancelJob(jobId, 'Analysis timed out (30 minute limit)');
+        this.cancelJob(jobId, 'Analysis timed out (4 hour limit)');
       }
     }, JOB_TIMEOUT_MS);
     this.timeouts.set(jobId, timer);
