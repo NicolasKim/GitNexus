@@ -39,7 +39,13 @@ import { mountToolRoutes } from './tool-routes.js';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { JobManager, JOB_TIMEOUT_MS } from './analyze-job.js';
-import { assertString, escapeRegExp, BadRequestError, createRouteLimiter } from './validation.js';
+import {
+  assertString,
+  escapeRegExp,
+  BadRequestError,
+  createRouteLimiter,
+  FILE_API_RATE_LIMIT_RPM,
+} from './validation.js';
 import { extractRepoName, getCloneDir, cloneOrPull } from './git-clone.js';
 import { logger, flushLoggerSync } from '../core/logger.js';
 
@@ -1307,7 +1313,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Read file — with path traversal guard
   // Rate-limited (CodeQL js/missing-rate-limiting): per-request fs.readFile.
-  app.get('/api/file', createRouteLimiter(), async (req, res) => {
+  app.get('/api/file', createRouteLimiter({ limit: FILE_API_RATE_LIMIT_RPM }), async (req, res) => {
     const entry = await resolveRepo(requestedRepo(req));
     if (!entry) {
       res.status(404).json({ error: 'Repository not found' });

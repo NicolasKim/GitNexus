@@ -110,6 +110,9 @@ export function escapeRegExp(input: string): string {
  */
 const DEFAULT_RATE_LIMIT_RPM = 60;
 
+/** /api/file — agent pipelines may burst parallel file reads; higher than default. */
+export const FILE_API_RATE_LIMIT_RPM = 120;
+
 /**
  * Project-specific subset of express-rate-limit options that callers may
  * override. Intentionally narrow — `Partial<RateLimitOptions>` would let a
