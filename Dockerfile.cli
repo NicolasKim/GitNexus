@@ -84,7 +84,19 @@ COPY --from=builder --chown=node:node /app/gitnexus/vendor ./gitnexus/vendor
 # unreachable from $PATH.
 RUN ln -s /app/gitnexus/dist/cli/index.js /usr/local/bin/gitnexus
 
+# Serve/MCP read pool uses load-only for optional extensions (no network INSTALL).
+# Pre-install FTS + VECTOR into the node user's LadybugDB extension dir so BM25/vector
+# search works offline in every gitnexus-read replica.
+ENV HOME=/home/node
+RUN mkdir -p /home/node && chown -R node:node /home/node
+
 USER node
+
+# Match gitnexus/src/core/lbug/lbug-config.ts default (16 GiB).
+ENV GITNEXUS_LBUG_MAX_DB_SIZE=17179869184
+
+RUN node gitnexus/scripts/install-duckdb-extension.mjs fts \
+    && node gitnexus/scripts/install-duckdb-extension.mjs VECTOR
 
 # The web UI defaults to http://localhost:4747 - keep that contract.
 ENV GITNEXUS_HOME=/data/gitnexus \
