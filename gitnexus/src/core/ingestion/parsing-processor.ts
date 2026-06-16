@@ -7,6 +7,8 @@ import { accumulateExportedTypesFromParsedNode, type ExportedTypeMap } from './c
 
 import type { ParsedFile } from 'gitnexus-shared';
 import { WorkerPool } from './workers/worker-pool.js';
+import type { SkippedPath } from './workers/clone-safety.js';
+import type { CfgSkipCounts } from './cfg/collect.js';
 import { logger } from '../logger.js';
 import type {
   ParseWorkerResult,
@@ -103,6 +105,7 @@ export const mergeChunkResults = (
         templateArguments: sym.templateArguments,
         ownerId: sym.ownerId,
         qualifiedName: sym.qualifiedName,
+        isDeleted: sym.isDeleted,
       });
     }
     if (exportedTypeMap) {
@@ -194,6 +197,54 @@ export const dispatchChunkParse = async (
       .map(([lang, count]) => `${lang}: ${count}`)
       .join(', ');
     logger.warn(`  Skipped unsupported languages: ${summary}`);
+  }
+
+  // Per-language CFG skip telemetry (#2195): functions skipped during the worker
+  // CFG walk, bucketed by reason. Only surfaced for a `--pdg` run (otherwise
+  // `cfgSkipped` is empty). Warn ONLY when a robustness-relevant bucket
+  // (too-deeply-nested / build-error) is non-zero — a too-many-lines skip is the
+  // expected, benign minified/generated-code case and would otherwise be spam.
+  const cfgSkipped = new Map<string, CfgSkipCounts>();
+  for (const result of chunkResults) {
+    for (const [lang, counts] of Object.entries(result.cfgSkipped ?? {})) {
+      const prev = cfgSkipped.get(lang) ?? { tooManyLines: 0, tooDeeplyNested: 0, buildError: 0 };
+      cfgSkipped.set(lang, {
+        tooManyLines: prev.tooManyLines + counts.tooManyLines,
+        tooDeeplyNested: prev.tooDeeplyNested + counts.tooDeeplyNested,
+        buildError: prev.buildError + counts.buildError,
+      });
+    }
+  }
+  for (const [lang, c] of cfgSkipped) {
+    if (c.tooDeeplyNested > 0 || c.buildError > 0) {
+      logger.warn(
+        `  CFG functions skipped (${lang}): ${c.tooDeeplyNested} too-deeply-nested, ` +
+          `${c.buildError} build-error(s), ${c.tooManyLines} over line cap`,
+      );
+    }
+  }
+
+  // Clone-safety telemetry (#2112): files whose parse output carried a value
+  // the structured-clone algorithm couldn't serialize across the worker
+  // boundary. The worker sanitized/dropped the offending value so the run
+  // could complete; surface the (rare) data loss so it's visible and the
+  // offending extractor can be fixed at source.
+  const skippedPaths: SkippedPath[] = [];
+  for (const result of chunkResults) {
+    for (const entry of result.skippedPaths ?? []) skippedPaths.push(entry);
+  }
+  if (skippedPaths.length > 0) {
+    // Keep the per-file reason ("stripped N value(s) from nodes" /
+    // "dropped non-serializable parsedFiles entry") — it distinguishes a
+    // recoverable strip from a whole-record drop, which a path-only line loses.
+    const shown = skippedPaths
+      .slice(0, 10)
+      .map((e) => `${e.path} (${e.reason})`)
+      .join(', ');
+    const more = skippedPaths.length > 10 ? ` …and ${skippedPaths.length - 10} more` : '';
+    logger.warn(
+      `  Sanitized ${skippedPaths.length} file(s) with non-serializable parse output: ${shown}${more}`,
+    );
   }
 
   onFileProgress?.(total, total, 'done');

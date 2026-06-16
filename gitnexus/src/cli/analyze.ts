@@ -41,8 +41,10 @@ import { warnMissingOptionalGrammars, getOptionalGrammarExtensions } from './opt
 import { glob } from 'glob';
 import fs from 'fs/promises';
 import { cliError } from './cli-message.js';
+import { EMBEDDING_DIMS_ERROR, normalizeEmbeddingDims } from './embedding-dims.js';
 import { formatElapsed } from './format-elapsed.js';
 import { isHfDownloadFailure } from '../core/embeddings/hf-env.js';
+import { safeUrl } from '../core/embeddings/http-client.js';
 import { isLocalEmbeddingRuntimeBlockerMessage } from '../core/embeddings/runtime-support.js';
 import { warnIfNpm11NpxRisk } from './resolve-invocation.js';
 
@@ -560,6 +562,10 @@ const ANALYZE_CLI_ENV_KEYS = [
   'GITNEXUS_EMBEDDING_SUB_BATCH_SIZE',
   'GITNEXUS_EMBEDDING_DEVICE',
   'GITNEXUS_ANALYZE_PROGRESS_ACTIVE',
+  'GITNEXUS_EMBEDDING_URL',
+  'GITNEXUS_EMBEDDING_MODEL',
+  'GITNEXUS_EMBEDDING_API_KEY',
+  'GITNEXUS_EMBEDDING_DIMS',
 ] as const;
 
 type AnalyzeEnvSnapshot = Record<(typeof ANALYZE_CLI_ENV_KEYS)[number], string | undefined>;
@@ -600,6 +606,12 @@ export interface AnalyzeOptions {
   /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
   skipAgentsMd?: boolean;
   /**
+   * Build the control-flow-graph / PDG substrate (#2081 M1). Opt-in; off by
+   * default. Threaded to both the worker (CFG build) and scope-resolution
+   * (BasicBlock/CFG emit).
+   */
+  pdg?: boolean;
+  /**
    * Stats inclusion in AGENTS.md and CLAUDE.md.
    *
    * Commander.js represents `--no-stats` as `stats: boolean` (default
@@ -620,6 +632,14 @@ export interface AnalyzeOptions {
    * before being threaded into the generated AGENTS.md / CLAUDE.md content.
    */
   defaultBranch?: string;
+  /**
+   * Index-branch selector (#2106). From `--branch`. Distinct from
+   * `defaultBranch` (cosmetic base_ref): this routes the index to a per-branch
+   * slot. NOT sourced from `.gitnexusrc` — the `.gitnexusrc` `branch` key is an
+   * alias for `defaultBranch` and must not change index placement. Defaults to
+   * the checked-out branch inside `runFullAnalysis` when omitted.
+   */
+  branch?: string;
   /** Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills). */
   indexOnly?: boolean;
   /** Index the folder even when no .git directory is present. */
@@ -655,6 +675,22 @@ export interface AnalyzeOptions {
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
   embeddingDevice?: string;
+  /**
+   * Extra fetch-wrapper function names to treat as HTTP consumers (#1589/#1852
+   * residual). Supplied via `.gitnexusrc` `fetchWrappers: [...]`. Threaded into
+   * the routes phase, where the cross-file consumer scan unions them with the
+   * auto-detected `fetch()` wrappers so a custom/axios-based wrapper named
+   * outside the built-in convention still produces `route_map` consumers.
+   */
+  fetchWrappers?: string[];
+  /** OpenAI-compatible embeddings base URL (incl. /v1). Overrides GITNEXUS_EMBEDDING_URL. */
+  embeddingBaseUrl?: string;
+  /** Embedding model name. Overrides GITNEXUS_EMBEDDING_MODEL. */
+  embeddingModel?: string;
+  /** Bearer token for the embeddings endpoint. Overrides GITNEXUS_EMBEDDING_API_KEY. Never logged. */
+  embeddingAuthToken?: string;
+  /** Embedding vector dimensions (positive integer string). Overrides GITNEXUS_EMBEDDING_DIMS. */
+  embeddingDims?: string;
 }
 
 /**
@@ -757,6 +793,21 @@ const analyzeCommandImpl = async (
       cliError(`  ${err instanceof Error ? err.message : String(err)}\n`, {
         recoveryHint: 'default-branch-invalid',
       });
+      process.exitCode = 1;
+      return;
+    }
+  }
+
+  // Validate the index-branch selector (#2106) the same way, so a malformed
+  // `--branch` exits before any expensive analysis starts. Capture the TRIMMED
+  // return so a whitespace-padded value (e.g. " feature" from shell completion)
+  // normalizes before the checked-out-branch mismatch guard and slug — otherwise
+  // it would false-reject on-branch or create a ghost index when detached.
+  if (cliOptions?.branch !== undefined) {
+    try {
+      cliOptions.branch = validateBranchName(cliOptions.branch, '--branch');
+    } catch (err) {
+      cliError(`  ${err instanceof Error ? err.message : String(err)}\n`);
       process.exitCode = 1;
       return;
     }
@@ -919,6 +970,109 @@ const analyzeCommandImpl = async (
       return;
     }
     process.env.GITNEXUS_EMBEDDING_DEVICE = options.embeddingDevice;
+  }
+
+  // --- Custom HTTP embedding endpoint flags (override GITNEXUS_EMBEDDING_* env vars) ---
+  const anyHttpEmbedFlag =
+    options.embeddingBaseUrl !== undefined ||
+    options.embeddingModel !== undefined ||
+    options.embeddingAuthToken !== undefined ||
+    options.embeddingDims !== undefined;
+
+  if (options.embeddingBaseUrl !== undefined) {
+    const url = options.embeddingBaseUrl.trim();
+    if (url.length === 0) {
+      cliError('  --embedding-base-url must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      cliError(`  --embedding-base-url is not a valid URL: "${url}".\n`);
+      process.exitCode = 1;
+      return;
+    }
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      cliError('  --embedding-base-url must use http:// or https://.\n');
+      process.exitCode = 1;
+      return;
+    }
+    // http-client strips trailing slashes; store as given (trimmed).
+    process.env.GITNEXUS_EMBEDDING_URL = url;
+  }
+
+  if (options.embeddingModel !== undefined) {
+    const model = options.embeddingModel.trim();
+    if (model.length === 0) {
+      cliError('  --embedding-model must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    process.env.GITNEXUS_EMBEDDING_MODEL = model;
+  }
+
+  if (options.embeddingAuthToken !== undefined) {
+    const token = options.embeddingAuthToken.trim();
+    if (token.length === 0) {
+      cliError('  --embedding-auth-token must not be empty.\n');
+      process.exitCode = 1;
+      return;
+    }
+    // Never log the token value.
+    process.env.GITNEXUS_EMBEDDING_API_KEY = token;
+  }
+
+  // Validate + normalize dims through the same shared helper the preAction
+  // hook uses, so the CLI path, this direct/programmatic-call path, schema.ts
+  // (parseInt) and http-client (/^\d+$/) all agree on one canonical value.
+  if (options.embeddingDims !== undefined) {
+    const dims = normalizeEmbeddingDims(options.embeddingDims);
+    if (dims === null) {
+      cliError(`  ${EMBEDDING_DIMS_ERROR}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    process.env.GITNEXUS_EMBEDDING_DIMS = dims;
+  }
+
+  // Custom-endpoint UX, emitting at most ONE message that reflects THIS run's
+  // intent (not ambient env). Order matters — the first matching branch wins:
+  //   1. flags given but --embeddings absent: the endpoint won't be used, so
+  //      say only that (no contradictory "Using…" line).
+  //   2. embeddings enabled + a complete endpoint (flags or env): confirm it,
+  //      masking the URL via safeUrl() since a base URL may carry credentials
+  //      in userinfo (http://user:pass@host) or a query token (?api_key=…)
+  //      that must not land in stdout/CI logs. The auth token is never printed.
+  //   3. embeddings enabled but only one of URL/MODEL supplied via flags:
+  //      http-client.isHttpMode() needs BOTH, so warn about the fallback.
+  // Gating on embeddingsEnabled also stops the old behaviour of printing
+  // "Using custom embedding endpoint" on every analyze run whenever the env
+  // vars happened to be set.
+  if (anyHttpEmbedFlag && !embeddingsEnabled) {
+    console.log(
+      '  Note: --embedding-* flags only apply when --embeddings is also passed; ' +
+        'no embeddings will be generated this run.\n',
+    );
+  } else if (
+    embeddingsEnabled &&
+    process.env.GITNEXUS_EMBEDDING_URL &&
+    process.env.GITNEXUS_EMBEDDING_MODEL
+  ) {
+    console.log(
+      `  Using custom embedding endpoint: ${safeUrl(process.env.GITNEXUS_EMBEDDING_URL)} ` +
+        `(model: ${process.env.GITNEXUS_EMBEDDING_MODEL})\n`,
+    );
+  } else if (
+    embeddingsEnabled &&
+    anyHttpEmbedFlag &&
+    (process.env.GITNEXUS_EMBEDDING_URL || process.env.GITNEXUS_EMBEDDING_MODEL)
+  ) {
+    console.log(
+      '  Note: custom HTTP embeddings require BOTH --embedding-base-url and --embedding-model ' +
+        '(or the matching env vars). Falling back to local ONNX embeddings.\n',
+    );
   }
 
   if (options.repairFts && options.force) {
@@ -1091,9 +1245,15 @@ const analyzeCommandImpl = async (
         skipGit: options.skipGit,
         skipAgentsMd,
         skipSkills,
+        // CFG/PDG substrate opt-in (#2081 M1) — threaded to both sinks downstream.
+        pdg: options.pdg === true,
         // Resolved default branch (CLI > .gitnexusrc > auto-detect > "main")
         // threaded into the generated regression-compare example (#243).
         defaultBranch: resolvedDefaultBranch,
+        // Index-branch selector (#2106). Read straight from the CLI flag (not
+        // the .gitnexusrc-merged options) so the cosmetic defaultBranch config
+        // can never change index placement. Undefined → auto-detect in pipeline.
+        branch: cliOptions?.branch,
         // commander.js `.option('--no-stats', …)` registers the flag as
         // `options.stats` (boolean, default true; `false` when the user
         // passed --no-stats). Reading `options.noStats` here returns
@@ -1110,6 +1270,9 @@ const analyzeCommandImpl = async (
         // GITNEXUS_WORKER_POOL_SIZE env mutation. `undefined` defers to the
         // env / auto-formula fallback inside the pipeline.
         workerPoolSize,
+        // Extra fetch-wrapper names from `.gitnexusrc` (#1589/#1852 residual);
+        // forwarded to the routes phase consumer scan.
+        fetchWrappers: options.fetchWrappers,
       },
       {
         onProgress: (_phase, percent, message) => {
@@ -1131,14 +1294,20 @@ const analyzeCommandImpl = async (
       // preserving the rest of the block (incl. --skills community rows). No-op
       // when the value already matches, so a routine up-to-date run is silent
       // (#1996 tri-review P2).
+      // Only refresh the repo-root AGENTS.md/CLAUDE.md base_ref for the
+      // PRIMARY/flat index (#2106 R2). A non-primary branch's up-to-date
+      // analyze must not churn the committed AGENTS.md — this mirrors the
+      // in-pipeline `if (!placement.branch)` gate around generateAIContextFiles.
       let baseRefRefreshed: string[] = [];
-      try {
-        const { refreshBaseRefLine } = await import('./ai-context.js');
-        baseRefRefreshed = (
-          await refreshBaseRefLine(repoPath, resolvedDefaultBranch, { skipAgentsMd })
-        ).files;
-      } catch {
-        /* best-effort — never fail the fast path over a context refresh */
+      if (result.isPrimaryBranch !== false) {
+        try {
+          const { refreshBaseRefLine } = await import('./ai-context.js');
+          baseRefRefreshed = (
+            await refreshBaseRefLine(repoPath, resolvedDefaultBranch, { skipAgentsMd })
+          ).files;
+        } catch {
+          /* best-effort — never fail the fast path over a context refresh */
+        }
       }
       clearInterval(elapsedTimer);
       process.removeListener('SIGINT', sigintHandler);
@@ -1234,6 +1403,7 @@ const analyzeCommandImpl = async (
               // Mirror runFullAnalysis `noStats` bridge (#1477) — same expression;
               // exercised on the `--skills` path by analyze-no-stats-bridge.test.ts.
               noStats: options.stats === false,
+              hasPdg: options.pdg === true,
             },
           );
         }

@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 13 tools are defined (per-repo + group_list/group_sync)
+ * - All 17 tools are defined (per-repo + group_list/group_sync)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -21,8 +21,8 @@ const MUTATING_TOOLS = new Set(['rename', 'group_sync']);
 const OPEN_WORLD_READ_ONLY_TOOLS = new Set(['query']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(13);
+  it('exports all tools (8 base + 1 explain + 1 pdg_query + 3 route/tool/shape + 1 api_impact + 1 trace + 2 group)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(17);
   });
 
   it('contains all expected tool names', () => {
@@ -34,9 +34,13 @@ describe('GITNEXUS_TOOLS', () => {
         'cypher',
         'context',
         'detect_changes',
+        'check',
         'rename',
         'impact',
+        'explain',
+        'pdg_query',
         'api_impact',
+        'trace',
       ]),
     );
   });
@@ -97,16 +101,23 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
-  it('query tool requires "query" parameter', () => {
+  it('query tool requires "search_query" parameter (renamed from "query" for #2175)', () => {
     const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
-    expect(queryTool.inputSchema.required).toContain('query');
-    expect(queryTool.inputSchema.properties.query).toBeDefined();
-    expect(queryTool.inputSchema.properties.query.type).toBe('string');
+    expect(queryTool.inputSchema.required).toContain('search_query');
+    // The legacy "query" key must NOT be advertised — Claude Code drops it (#2175).
+    expect(queryTool.inputSchema.required).not.toContain('query');
+    expect(queryTool.inputSchema.properties.query).toBeUndefined();
+    expect(queryTool.inputSchema.properties.search_query).toBeDefined();
+    expect(queryTool.inputSchema.properties.search_query.type).toBe('string');
   });
 
-  it('cypher tool requires "query" parameter', () => {
+  it('cypher tool requires "statement" parameter (renamed from "query" for #2175)', () => {
     const cypherTool = GITNEXUS_TOOLS.find((t) => t.name === 'cypher')!;
-    expect(cypherTool.inputSchema.required).toContain('query');
+    expect(cypherTool.inputSchema.required).toContain('statement');
+    expect(cypherTool.inputSchema.required).not.toContain('query');
+    expect(cypherTool.inputSchema.properties.query).toBeUndefined();
+    expect(cypherTool.inputSchema.properties.statement).toBeDefined();
+    expect(cypherTool.inputSchema.properties.statement.type).toBe('string');
     expect(cypherTool.inputSchema.properties.params).toBeDefined();
     expect(cypherTool.inputSchema.properties.params.type).toBe('object');
     expect(cypherTool.inputSchema.properties.params.description).toContain('prepared statement');
@@ -173,6 +184,19 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
+  it('per-repo tools have an optional branch scope param (#2106); group/list tools do not', () => {
+    for (const tool of GITNEXUS_TOOLS) {
+      if (tool.name === 'list_repos' || GROUP_TOOLS.has(tool.name)) {
+        expect(tool.inputSchema.properties.branch).toBeUndefined();
+        continue;
+      }
+      expect(tool.inputSchema.properties.branch, tool.name).toBeDefined();
+      expect(tool.inputSchema.properties.branch.type).toBe('string');
+      // Optional — omitting it keeps the default/primary-branch behavior.
+      expect(tool.inputSchema.required).not.toContain('branch');
+    }
+  });
+
   it('group tools without backend repo param omit repo property', () => {
     for (const name of ['group_list', 'group_sync'] as const) {
       const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
@@ -202,6 +226,38 @@ describe('GITNEXUS_TOOLS', () => {
     const detectTool = GITNEXUS_TOOLS.find((t) => t.name === 'detect_changes')!;
     const scopeProp = detectTool.inputSchema.properties.scope;
     expect(scopeProp.enum).toEqual(['unstaged', 'staged', 'all', 'compare']);
+  });
+
+  // ─── explain (#2083 M3 U6) ─────────────────────────────────────────
+
+  it('explain tool is anchorless-optional with a bounded limit and a branch scope', () => {
+    const explainTool = GITNEXUS_TOOLS.find((t) => t.name === 'explain')!;
+    expect(explainTool).toBeDefined();
+    // Anchorless calls (enumerate all findings) must be valid.
+    expect(explainTool.inputSchema.required).toEqual([]);
+    expect(explainTool.inputSchema.properties.target).toBeDefined();
+    expect(explainTool.inputSchema.properties.target.type).toBe('string');
+    const limit = explainTool.inputSchema.properties.limit;
+    expect(limit).toBeDefined();
+    expect(limit.type).toBe('integer');
+    expect(limit.minimum).toBe(1);
+    expect(limit.maximum).toBeGreaterThan(0);
+    // Branch-scoped per #2106 (injected via BRANCH_SCOPED_TOOLS).
+    expect(explainTool.inputSchema.properties.branch).toBeDefined();
+  });
+
+  it('explain description names the --pdg requirement and the KTD10 contract caveats', () => {
+    const explainTool = GITNEXUS_TOOLS.find((t) => t.name === 'explain')!;
+    const d = explainTool.description;
+    expect(d).toContain('--pdg');
+    expect(d).toContain('intra-procedural');
+    // The named blind-spot classes (plan KTD10) must reach the consumer.
+    expect(d.toLowerCase()).toContain('closure/callback');
+    expect(d.toLowerCase()).toContain('property/field');
+    expect(d.toLowerCase()).toContain('guard-style');
+    expect(d.toLowerCase()).toContain('cross-function');
+    expect(d.toLowerCase()).toContain('commonjs');
+    expect(d.toLowerCase()).toContain('exception');
   });
 
   it('api_impact tool has no required parameters', () => {

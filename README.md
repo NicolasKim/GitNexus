@@ -123,7 +123,7 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 
 ### MCP Setup
 
-`gitnexus setup` auto-detects your editors and writes the correct global MCP config. You only need to run it once.
+`gitnexus setup` auto-detects your editors and writes the correct global MCP config. You only need to run it once. To configure only selected integrations, pass `--coding-agent`/`-c` with a comma-separated list or repeat the option, for example `gitnexus setup -c cursor,codex`.
 
 ### Editor Support
 
@@ -224,7 +224,7 @@ args = ["-y", "gitnexus@latest", "mcp"]
 ### CLI Commands
 
 ```bash
-gitnexus setup                   # Configure MCP for your editors (one-time)
+gitnexus setup                   # Configure MCP for detected editors (one-time; use -c to select)
 gitnexus uninstall               # Preview removal of GitNexus MCP/skills/hooks (add --force to apply)
 gitnexus analyze [path]          # Index a repository (or update stale index)
 gitnexus analyze --repair-fts    # Fast path: rebuild/verify only FTS indexes on existing index data
@@ -324,6 +324,7 @@ Most `analyze` knobs are also CLI flags (`--workers`, `--worker-timeout`, `--max
 | `GITNEXUS_VERBOSE`                     | unset                     | When `1`, enables verbose ingestion logs (skipped-file warnings, per-chunk throughput, parse-cache stats). Equivalent to `--verbose`.                      | Debugging an analyze that "completed" but seems to have missed files; tuning `--workers` / chunk concurrency against observable throughput. |
 | `GITNEXUS_PROFILE_DEFERRED`            | unset                     | When `1`, emits `[deferred-profile]` timing/progress logs for the post-chunk deferred resolution band (imports → heritage → buildHeritageMap → legacy call resolution). Implied by `GITNEXUS_VERBOSE`. | Diagnosing analyze stalls in "Resolving calls (all chunks)" on large Java/Kotlin repos (issue #1741) without the full verbose ingestion noise. |
 | `GITNEXUS_PROFILE_DEFERRED_SLOW_MS`    | `3000` (verbose) / `5000` | Per-file threshold in ms above which `processCallsFromExtracted` emits a `slow file …` log line. Parsed via `Number()`: accepts integers (`5000`), scientific notation (`2.5e3`), decimals (`.5`), and hex (`0x10`). Non-finite or non-positive values fall back to the default. | Hunting a few outlier files dominating the deferred call-resolution stage; lower to surface more, raise to focus only on the worst.          |
+| `PROF_LBUG_LOAD`                       | unset                     | When `1`, emits one `[lbug-load prof]` summary line per `loadGraphToLbug` call breaking the graph-DB persistence wall into stages (`csv-emit` / `copy-nodes` / `copy-rels` / `fallback` / `total`) plus node & edge counts. Zero-cost when unset. | Attributing large-repo analyze wall time across CSV generation vs. LadybugDB `COPY` (issue #2203) — the analyze "emit" timing is the scope-resolution bucket, not this DB-write path. |
 | `GITNEXUS_MAX_FILE_SIZE`               | `512` (KB)                | Walker skip threshold in KB. Hard cap is `32768` (tree-sitter buffer ceiling). Equivalent to `--max-file-size <kb>`.                                       | Indexing repos with intentionally-large source files (generated parsers, vendored bundles) that should still be parsed.                     |
 | `GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS` | `30000`                   | Worker idle timeout in milliseconds before retry/fallback. Equivalent to `--worker-timeout <seconds>` × 1000.                                              | Slow-parsing files (large minified JS, deeply-nested TS types) that legitimately need more than 30s.                                        |
 | `GITNEXUS_WAL_CHECKPOINT_THRESHOLD`       | `67108864` (64 MiB)       | LadybugDB WAL auto-checkpoint threshold in bytes. Equivalent to `--wal-checkpoint-threshold <bytes>`. `-1` keeps LadybugDB's stock threshold (~16 MiB). Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments. | You need a larger or smaller WAL auto-checkpoint threshold for your analyze workload.                                                         |
@@ -360,7 +361,7 @@ It is opt-in and a no-op without `UNDERSTAND_QUICKLY_TOKEN` — a fine-grained G
 | `group_query`     | Search execution flows across all repos in a group               | —            |
 | `group_status`    | Check staleness of repos in a group                              | —            |
 
-> When only one repo is indexed, the `repo` parameter is optional. With multiple repos, specify which one: `query({query: "auth", repo: "my-app"})`.
+> When only one repo is indexed, the `repo` parameter is optional. With multiple repos, specify which one: `query({search_query: "auth", repo: "my-app"})`.
 
 **Resources** for instant context:
 
@@ -703,6 +704,8 @@ GitNexus builds a complete knowledge graph of your codebase through a multi-phas
 
 **Imports** — cross-file import resolution · **Named Bindings** — `import { X as Y }` / re-export tracking · **Exports** — public/exported symbol detection · **Heritage** — class inheritance, interfaces, mixins · **Type Annotations** — explicit type extraction for receiver resolution · **Constructor Inference** — infer receiver type from constructor calls (`self`/`this` resolution included for all languages) · **Config** — language toolchain config parsing (tsconfig, go.mod, etc.) · **Frameworks** — AST-based framework pattern detection · **Entry Points** — entry point scoring heuristics
 
+**Control flow (CFG, opt-in `--pdg`)** — per-function control-flow graphs (`BasicBlock` nodes + `CFG` edges) feeding the PDG/taint substrate, currently **TypeScript & JavaScript** (#2081 M1); other languages planned. Off by default.
+
 ---
 
 ## Tool Examples
@@ -736,7 +739,7 @@ gitnexus impact get_embeddings --uid "Function:src/embed.py:get_embeddings"  # e
 ### Process-Grouped Search
 
 ```
-query({query: "authentication middleware"})
+query({search_query: "authentication middleware"})
 
 processes:
   - summary: "LoginFlow"

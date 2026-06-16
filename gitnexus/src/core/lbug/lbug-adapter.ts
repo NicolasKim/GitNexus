@@ -14,10 +14,12 @@ import {
   REL_TABLE_NAME,
   SCHEMA_QUERIES,
   EMBEDDING_TABLE_NAME,
+  CREATE_VECTOR_INDEX_QUERY,
   STALE_HASH_SENTINEL,
   NodeTableName,
 } from './schema.js';
 import { streamAllCSVsToDisk } from './csv-generator.js';
+import { getNodeLabel as deriveNodeLabel, type WriteStreamFactory } from './rel-pair-routing.js';
 import type { CachedEmbedding } from '../embeddings/types.js';
 import { extensionManager, type ExtensionEnsureOptions } from './extension-loader.js';
 import {
@@ -47,9 +49,9 @@ import { logger } from '../logger.js';
 // ---------------------------------------------------------------------------
 // Relationship CSV splitting — extracted for testability (PR #818)
 // ---------------------------------------------------------------------------
-
-/** Factory for creating WriteStreams — injectable for testing. */
-export type WriteStreamFactory = (filePath: string) => import('fs').WriteStream;
+// WriteStreamFactory is imported above from rel-pair-routing.ts (its canonical
+// home) for splitRelCsvByLabelPair's signature; no external code imports it from
+// here, so it is not re-exported.
 
 /** Result of splitting the relationship CSV into per-label-pair files. */
 export interface RelCsvSplitResult {
@@ -62,6 +64,15 @@ export interface RelCsvSplitResult {
 
 /**
  * Split a relationship CSV into per-label-pair files on disk.
+ *
+ * @internal RETAINED AS A DIFFERENTIAL ORACLE. As of #2203 U2, production emit
+ * routes relationships to per-pair files directly during the single pass (see
+ * RelPairRouter in `rel-pair-routing.ts`), so this function has NO production
+ * callers — it is kept ONLY so the byte-identity test in
+ * `test/integration/csv-pipeline.test.ts` ("direct per-pair emit matches the
+ * split oracle") can diff the direct-emit output against this proven path. Do
+ * NOT delete it as dead code without also removing that test and accepting the
+ * loss of the byte-identity guard (and likewise `test/unit/rel-csv-split.test.ts`).
  *
  * Streams the CSV line-by-line, routing each relationship to a file named
  * `rel_{fromLabel}_{toLabel}.csv`. Handles backpressure correctly: only one
@@ -171,6 +182,11 @@ let currentDbPath: string | null = null;
 let currentDbReadOnly = false;
 let ftsLoaded = false;
 let vectorExtensionLoaded = false;
+// In-process guard so a repeated createVectorIndex() within one connection
+// lifetime skips the DB round-trip (mirrors ensuredFTSIndexes). Reset wherever
+// vectorExtensionLoaded resets, so it can never stay true against a swapped or
+// closed connection.
+let vectorIndexEnsured = false;
 
 /**
  * In-process cache of FTS indexes observed against the current singleton
@@ -603,6 +619,7 @@ const resetOpenConnectionState = (): void => {
   currentDbPath = null;
   ftsLoaded = false;
   vectorExtensionLoaded = false;
+  vectorIndexEnsured = false;
   ensuredFTSIndexes.clear();
 };
 
@@ -690,6 +707,7 @@ export const withLbugDb = async <T>(
         currentDbPath = null;
         ftsLoaded = false;
         vectorExtensionLoaded = false;
+        vectorIndexEnsured = false;
         ensuredFTSIndexes.clear();
       });
       // Sleep outside the lock — no need to block others while waiting
@@ -716,6 +734,7 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
     currentDbPath = null;
     ftsLoaded = false;
     vectorExtensionLoaded = false;
+    vectorIndexEnsured = false;
     ensuredFTSIndexes.clear();
   }
 
@@ -869,6 +888,17 @@ export const loadGraphToLbug = async (
 
   const log = onProgress || (() => {});
 
+  // ── #2203 persistence-path profiling ──────────────────────────────────
+  // Mirrors the PROF_SCOPE_RESOLUTION pattern (scope-resolution/pipeline/
+  // run.ts): zero-cost when off — process.hrtime.bigint() is only read under
+  // PROF_LBUG_LOAD=1, and the summary is logged behind the same gate. Fills
+  // the gap that the DB-persistence path is un-timed today (the analyze
+  // "emit" number is the scope-resolution emit bucket, not this COPY path).
+  const PROF = process.env.PROF_LBUG_LOAD === '1';
+  const mark = (): bigint => (PROF ? process.hrtime.bigint() : 0n);
+  const span = (a: bigint, b: bigint): string => (Number(b - a) / 1e6).toFixed(1);
+  const tStart = mark();
+
   let csvDir: string;
   if (process.platform === 'win32' && /[^\x00-\x7F]/.test(storagePath)) {
     const hash = crypto.createHash('sha256').update(storagePath).digest('hex').slice(0, 16);
@@ -879,13 +909,9 @@ export const loadGraphToLbug = async (
 
   log('Streaming CSVs to disk...');
   const csvResult = await streamAllCSVsToDisk(graph, repoPath, csvDir);
+  const tCsv = mark();
 
   const validTables = new Set<string>(NODE_TABLES as readonly string[]);
-  const getNodeLabel = (nodeId: string): string => {
-    if (nodeId.startsWith('comm_')) return 'Community';
-    if (nodeId.startsWith('proc_')) return 'Process';
-    return nodeId.split(':')[0];
-  };
 
   // Bulk COPY all node CSVs (sequential — LadybugDB allows only one write txn at a time)
   const nodeFiles = [...csvResult.nodeFiles.entries()];
@@ -915,37 +941,32 @@ export const loadGraphToLbug = async (
     }
   }
 
-  // Bulk COPY relationships — split by FROM→TO label pair (LadybugDB requires it)
-  const { relHeader, relsByPairMeta, pairWriteStreams, skippedRels, totalValidRels } =
-    await splitRelCsvByLabelPair(csvResult.relCsvPath, csvDir, validTables, getNodeLabel);
+  const tCopyNodes = mark();
 
-  // Close all per-pair write streams before COPY. `stream/promises.finished`
-  // resolves on the stream's 'finish' event and rejects on 'error' — replaces
-  // a hand-rolled promisification with the stdlib primitive.
-  await Promise.all(
-    Array.from(pairWriteStreams.values()).map(async (ws) => {
-      ws.end();
-      await finished(ws);
-    }),
-  );
+  // Bulk COPY relationships. They were already routed to per-FROM→TO-label-pair
+  // files during the emit pass (#2203 U2) — there is no monolithic relations.csv
+  // to re-read/re-split here; we COPY each pair file directly.
+  const { relsByPair, relHeader, skippedRels, totalValidRels } = csvResult;
+  let tCopyRels = tCopyNodes;
+  let tFallback = tCopyNodes;
 
   const insertedRels = totalValidRels;
   const warnings: string[] = [];
   if (insertedRels > 0) {
-    log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPairMeta.size} types`);
+    log(`Loading edges: ${insertedRels.toLocaleString()} across ${relsByPair.size} types`);
 
     let pairIdx = 0;
     let failedPairEdges = 0;
     const failedPairCsvPaths = new Set<string>();
 
-    for (const [pairKey, { csvPath: pairCsvPath, rows }] of relsByPairMeta) {
+    for (const [pairKey, { csvPath: pairCsvPath, rows }] of relsByPair) {
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const normalizedPath = normalizeCopyPath(pairCsvPath);
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
       if (pairIdx % 5 === 0 || rows > 1000) {
-        log(`Loading edges: ${pairIdx}/${relsByPairMeta.size} types (${fromLabel} -> ${toLabel})`);
+        log(`Loading edges: ${pairIdx}/${relsByPair.size} types (${fromLabel} -> ${toLabel})`);
       }
 
       try {
@@ -971,6 +992,7 @@ export const loadGraphToLbug = async (
         } catch {}
       }
     }
+    tCopyRels = mark();
 
     if (failedPairCsvPaths.size > 0) {
       log(`Inserting ${failedPairEdges} edges individually (missing schema pairs)`);
@@ -990,15 +1012,14 @@ export const loadGraphToLbug = async (
         } catch {}
       }
       if (allLines.length > 1) {
-        await fallbackRelationshipInserts(allLines, validTables, getNodeLabel);
+        await fallbackRelationshipInserts(allLines, validTables, deriveNodeLabel);
       }
     }
+    tFallback = mark();
   }
 
-  // Cleanup all CSVs
-  try {
-    await fs.unlink(csvResult.relCsvPath);
-  } catch {}
+  // Cleanup all CSVs (per-pair rel files are unlinked in the COPY loop above;
+  // the remaining sweep below catches node CSVs + any leftover pair files).
   for (const [, { csvPath }] of csvResult.nodeFiles) {
     try {
       await fs.unlink(csvPath);
@@ -1015,6 +1036,18 @@ export const loadGraphToLbug = async (
   try {
     await fs.rmdir(csvDir);
   } catch {}
+
+  if (PROF) {
+    const tEnd = mark();
+    let totalNodeRows = 0;
+    for (const [, { rows }] of csvResult.nodeFiles) totalNodeRows += rows;
+    logger.warn(
+      `[lbug-load prof] csv-emit=${span(tStart, tCsv)}ms ` +
+        `copy-nodes=${span(tCsv, tCopyNodes)}ms copy-rels=${span(tCopyNodes, tCopyRels)}ms ` +
+        `fallback=${span(tCopyRels, tFallback)}ms total=${span(tStart, tEnd)}ms ` +
+        `(${totalNodeRows} nodes, ${insertedRels} rels)`,
+    );
+  }
 
   return { success: true, insertedRels, skippedRels, warnings };
 };
@@ -1671,6 +1704,7 @@ export const closeLbug = async (): Promise<void> => {
   currentDbPath = null;
   ftsLoaded = false;
   vectorExtensionLoaded = false;
+  vectorIndexEnsured = false;
   ensuredFTSIndexes.clear();
 };
 
@@ -1829,6 +1863,62 @@ export const deleteAllCommunitiesAndProcesses = async (): Promise<{
   return { nodesDeleted };
 };
 
+/**
+ * Drop every interprocedural `TAINT_PATH` relationship (#2084 M4 U6). Used at
+ * the start of an incremental `--pdg` writeback so the `taintSummaries` phase
+ * re-materialises them from scratch on the FULL recomputed graph.
+ *
+ * TAINT_PATH validity is a WHOLE-PROGRAM property (a flow A→C can be
+ * invalidated by a change to an INTERMEDIATE function whose file is neither A
+ * nor C). The endpoint-writability extract rule (`extractChangedSubgraph`)
+ * cannot see that — an A→C edge between two unchanged files would be skipped
+ * and a stale finding would survive. So, exactly like Community/Process, the
+ * sound move is delete-all-then-rebuild: cheap because TAINT_PATH is sparse
+ * (per-run capped), and the compute side already rebuilds every summary each
+ * run. Relationship-level (TAINT_PATH is an edge type, not a node label), so a
+ * plain DELETE on the typed CodeRelation rows — endpoints are untouched.
+ */
+export const deleteAllInterprocTaintPaths = async (): Promise<{ edgesDeleted: number }> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  let edgesDeleted = 0;
+  let countResult: lbug.QueryResult | lbug.QueryResult[] | undefined;
+  try {
+    countResult = await conn.query(
+      `MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' RETURN count(r) AS cnt`,
+    );
+    const result = Array.isArray(countResult) ? countResult[0] : countResult;
+    const rows = await result.getAll();
+    const count = Number(rows[0]?.cnt ?? rows[0]?.[0] ?? 0);
+    if (count > 0) {
+      await conn.query(`MATCH ()-[r:CodeRelation]->() WHERE r.type = 'TAINT_PATH' DELETE r`);
+      edgesDeleted = count;
+    }
+  } catch (err) {
+    // A missing table on a freshly-initialized DB is the benign, expected case
+    // (the count query above is what throws) — stay silent. Any OTHER failure
+    // (lock, disk, native error) would leave stale TAINT_PATH rows that the
+    // subsequent re-extract then DUPLICATES (CodeRelation has no PK), so it
+    // must ABORT the writeback (#2084 review P2-5): re-throw so the caller's
+    // crash-recovery dirty flag forces a clean full rebuild on the next run,
+    // rather than silently writing duplicate cross-function findings.
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/no table|not exist|not found|does not exist|Table .* does not exist/i.test(msg)) {
+      if (countResult) await closeQueryResults(countResult);
+      return { edgesDeleted };
+    }
+    if (countResult) await closeQueryResults(countResult);
+    throw new Error(
+      `[taint-interproc] failed to clear existing TAINT_PATH edges before incremental ` +
+        `re-write (${msg}) — aborting to avoid duplicate cross-function findings; ` +
+        `the next run will full-rebuild`,
+    );
+  }
+  if (countResult) await closeQueryResults(countResult);
+  return { edgesDeleted };
+};
+
 // ============================================================================
 // Full-Text Search (FTS) Functions
 // ============================================================================
@@ -1934,6 +2024,50 @@ export const createFTSIndex = async (
       ensuredFTSIndexes.add(key);
       return;
     }
+    throw e;
+  }
+};
+
+/**
+ * Create the HNSW vector index on the CodeEmbedding table.
+ *
+ * MUST run via `conn.query()` (here through `queryAndDrain`), NOT through the
+ * prepared `executeQuery`/`conn.prepare()` path: `CALL CREATE_VECTOR_INDEX(...)`
+ * compiles to multiple statements, which LadybugDB cannot prepare — it fails
+ * with "Connection Exception: We do not support prepare multiple statements."
+ * Routing index creation through `executeQuery` (prepared) is exactly what
+ * broke vector-index creation during `analyze` (#2114; the singleton
+ * `executeQuery` was switched to the prepared path in #1655 while FTS index
+ * creation kept using `conn.query()`, which is why FTS survived and VECTOR did
+ * not). Mirrors `createFTSIndex` above.
+ *
+ * Returns `true` on success (or when the index already exists — idempotent so
+ * incremental re-runs don't spuriously downgrade to exact scan), `false` when
+ * the VECTOR extension is unavailable or the connection is read-only. Any other
+ * failure propagates so the caller can log it.
+ */
+export const createVectorIndex = async (): Promise<boolean> => {
+  if (!conn) {
+    throw new Error('LadybugDB not initialized. Call initLbug first.');
+  }
+  // Already built on this connection — skip the round-trip (mirrors createFTSIndex).
+  if (vectorIndexEnsured) return true;
+  if (!(await loadVectorExtension())) {
+    return false;
+  }
+  try {
+    await queryAndDrain(conn, CREATE_VECTOR_INDEX_QUERY);
+    vectorIndexEnsured = true;
+    return true;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Idempotent: a prior analyze already built the HNSW index.
+    if (msg.includes('already exists')) {
+      vectorIndexEnsured = true;
+      return true;
+    }
+    // Read-only DB (e.g. the MCP query pool): writable analyze owns creation.
+    if (isReadOnlyDbError(e)) return false;
     throw e;
   }
 };
