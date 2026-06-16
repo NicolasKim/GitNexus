@@ -21,6 +21,7 @@ import {
   registerRepo,
   updateRepoDescription,
   removeBranchIndex,
+  loadMeta,
   listRegisteredRepos,
   resolveRegistryEntry,
   canonicalizePath,
