@@ -34,6 +34,8 @@ export interface LaunchOptions {
   dropEmbeddings?: boolean;
   registryName?: string;
   description?: string;
+  /** Index-branch selector (#2106). When set, indexes the named branch slot. */
+  branch?: string;
 }
 
 const MAX_WORKER_RETRIES = 2;
@@ -163,6 +165,7 @@ export function createLaunchAnalysisWorker(deps: LaunchDeps) {
           dropEmbeddings: !!opts.dropEmbeddings,
           ...(opts.registryName ? { registryName: opts.registryName } : {}),
           ...(opts.description ? { description: opts.description } : {}),
+          ...(opts.branch ? { branch: opts.branch } : {}),
         },
       });
     };

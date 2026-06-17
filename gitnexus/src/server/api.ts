@@ -17,6 +17,8 @@ import {
   loadMeta,
   listRegisteredRepos,
   getStoragePath,
+  getStoragePaths,
+  removeBranchIndex,
   updateRepoDescription,
 } from '../storage/repo-manager.js';
 import {
@@ -566,6 +568,66 @@ const requestedRepo = (req: express.Request): string | undefined => {
   return undefined;
 };
 
+/** Optional branch index selector (#2106) from query or JSON body. */
+export const requestedBranch = (req: express.Request): string | undefined => {
+  const fromQuery = typeof req.query.branch === 'string' ? req.query.branch : undefined;
+  if (fromQuery) return fromQuery;
+
+  if (req.body && typeof req.body === 'object' && typeof req.body.branch === 'string') {
+    return req.body.branch;
+  }
+
+  return undefined;
+};
+
+/** Registry entry shape required for branch-scoped data-plane routes. */
+export type ScopedRepoEntry = {
+  name: string;
+  path: string;
+  storagePath: string;
+  branch?: string;
+  branches?: { branch: string; indexedAt: string; lastCommit: string; stats?: unknown }[];
+};
+
+/**
+ * Resolve lbug/meta paths for a registry entry, optionally scoped to a branch.
+ * Mirrors MCP LocalBackend.applyBranchScope for REST data-plane routes.
+ */
+export const scopeEntryToBranch = async (
+  entry: ScopedRepoEntry,
+  branch?: string,
+): Promise<{ lbugPath: string; metaPath: string; branch?: string }> => {
+  if (!branch) {
+    const paths = getStoragePaths(entry.path);
+    return { lbugPath: paths.lbugPath, metaPath: paths.metaPath, branch: entry.branch };
+  }
+
+  if (entry.branch && entry.branch === branch) {
+    const paths = getStoragePaths(entry.path);
+    return { lbugPath: paths.lbugPath, metaPath: paths.metaPath, branch: entry.branch };
+  }
+
+  const summary = entry.branches?.find((b) => b.branch === branch);
+  if (summary) {
+    const paths = getStoragePaths(entry.path, branch);
+    return { lbugPath: paths.lbugPath, metaPath: paths.metaPath, branch: summary.branch };
+  }
+
+  if (!entry.branch) {
+    const flatMeta = await loadMeta(entry.storagePath);
+    if (flatMeta?.branch && flatMeta.branch === branch) {
+      const paths = getStoragePaths(entry.path);
+      return { lbugPath: paths.lbugPath, metaPath: paths.metaPath, branch: flatMeta.branch };
+    }
+  }
+
+  const indexed = [entry.branch, ...(entry.branches?.map((b) => b.branch) ?? [])].filter(Boolean);
+  const available = indexed.length > 0 ? indexed.join(', ') : '(primary only)';
+  throw new BadRequestError(
+    `Branch "${branch}" is not indexed for "${entry.name}". Indexed branches: ${available}.`,
+  );
+};
+
 /**
  * Handle a GET /api/file request body. Extracted from createServer's route
  * registration so it can be unit-tested without spinning up an HTTP server
@@ -650,7 +712,7 @@ export const handleFileRequest = async (
 export const handleQueryRequest = async (
   req: express.Request,
   res: express.Response,
-  resolveRepo: (repoName?: string) => Promise<{ storagePath: string } | undefined>,
+  resolveRepo: (repoName?: string) => Promise<ScopedRepoEntry | undefined>,
 ): Promise<void> => {
   try {
     const cypher = req.body.cypher as string;
@@ -671,12 +733,20 @@ export const handleQueryRequest = async (
       res.status(404).json({ error: 'Repository not found' });
       return;
     }
-    const lbugPath = path.join(entry.storagePath, 'lbug');
-    const result = await withLbugDb(lbugPath, () => executePrepared(cypher, queryParams ?? {}), {
-      readOnly: true,
-    });
+    const scoped = await scopeEntryToBranch(entry, requestedBranch(req));
+    const result = await withLbugDb(
+      scoped.lbugPath,
+      () => executePrepared(cypher, queryParams ?? {}),
+      {
+        readOnly: true,
+      },
+    );
     res.json({ result });
   } catch (err: any) {
+    if (err instanceof BadRequestError) {
+      res.status(err.status).json({ error: err.message });
+      return;
+    }
     if (isReadOnlyDbError(err)) {
       res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
       return;
@@ -935,6 +1005,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           lastCommit: r.lastCommit,
           description: r.description,
           stats: r.stats,
+          branch: r.branch,
+          branches: r.branches,
         })),
       );
     } catch (err: any) {
@@ -958,12 +1030,27 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
       const meta = await loadMeta(entry.storagePath);
+      const branch = requestedBranch(req);
+      let scopedMeta = meta;
+      let scopedStats = meta?.stats ?? entry.stats ?? {};
+      let scopedIndexedAt = meta?.indexedAt ?? entry.indexedAt;
+      if (branch) {
+        const scoped = await scopeEntryToBranch(entry, branch);
+        const branchMeta = await loadMeta(path.dirname(scoped.lbugPath));
+        if (branchMeta) {
+          scopedMeta = branchMeta;
+          scopedStats = branchMeta.stats ?? {};
+          scopedIndexedAt = branchMeta.indexedAt;
+        }
+      }
       res.json({
         name: entry.name,
         repoPath: entry.path,
-        indexedAt: meta?.indexedAt ?? entry.indexedAt,
-        description: meta?.description ?? entry.description,
-        stats: meta?.stats ?? entry.stats ?? {},
+        branch: branch ?? entry.branch ?? scopedMeta?.branch,
+        indexedAt: scopedIndexedAt,
+        description: scopedMeta?.description ?? entry.description,
+        stats: scopedStats,
+        branches: entry.branches,
       });
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to get repo info' });
@@ -1094,6 +1181,84 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }
   });
 
+  // Delete a single non-primary branch index (#2106)
+  app.delete('/api/repo/branch', createRouteLimiter(), requireLocalhostOrigin, async (req, res) => {
+    try {
+      const repoName = requestedRepo(req);
+      const branch = requestedBranch(req);
+      if (!repoName) {
+        res.status(400).json({ error: 'Missing repo name' });
+        return;
+      }
+      if (!branch) {
+        res.status(400).json({ error: 'Missing branch name (query param ?branch=)' });
+        return;
+      }
+
+      const entry = await resolveRepo(repoName);
+      if (!entry) {
+        res.status(404).json({ error: 'Repository not found' });
+        return;
+      }
+
+      // Primary flat index must be deleted via DELETE /api/repo
+      if (entry.branch && entry.branch === branch) {
+        res.status(400).json({
+          error: `Branch "${branch}" is the primary index. Use DELETE /api/repo to remove the whole repository index.`,
+        });
+        return;
+      }
+      if (!entry.branch && !entry.branches?.length) {
+        const flatMeta = await loadMeta(entry.storagePath);
+        if (!flatMeta?.branch || flatMeta.branch === branch) {
+          res.status(400).json({
+            error: `Branch "${branch}" is the primary index. Use DELETE /api/repo to remove the whole repository index.`,
+          });
+          return;
+        }
+      }
+
+      const summary = entry.branches?.find((b: { branch: string }) => b.branch === branch);
+      if (!summary) {
+        res.status(404).json({ error: `No indexed branch named "${branch}" for this repository.` });
+        return;
+      }
+
+      const lockKey = getStoragePath(entry.path);
+      const lockErr = acquireRepoLock(lockKey);
+      if (lockErr) {
+        res.status(409).json({ error: lockErr });
+        return;
+      }
+
+      try {
+        try {
+          await closeLbug();
+        } catch {}
+
+        const { storagePath, lbugPath } = getStoragePaths(entry.path, summary.branch);
+        const branchDir = path.dirname(lbugPath);
+        const branchesRoot = path.join(storagePath, 'branches') + path.sep;
+        if (!branchDir.startsWith(branchesRoot)) {
+          res
+            .status(400)
+            .json({ error: 'Refusing to delete branch index outside .gitnexus/branches' });
+          return;
+        }
+
+        await fs.rm(branchDir, { recursive: true, force: true });
+        await removeBranchIndex(entry.path, summary.branch);
+        await backend.init().catch(() => {});
+
+        res.json({ deleted: entry.name, branch: summary.branch });
+      } finally {
+        releaseRepoLock(lockKey);
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Failed to delete branch index' });
+    }
+  });
+
   // Get full graph
   app.get('/api/graph', async (req, res) => {
     try {
@@ -1102,7 +1267,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const scoped = await scopeEntryToBranch(entry, requestedBranch(req));
+      const lbugPath = scoped.lbugPath;
       const includeContent = req.query.includeContent === 'true';
       const stream = req.query.stream === 'true';
 
@@ -1190,7 +1356,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const scoped = await scopeEntryToBranch(entry, requestedBranch(req));
+      const lbugPath = scoped.lbugPath;
       const parsedLimit = Number(req.body.limit ?? 10);
       const limit = Number.isFinite(parsedLimit)
         ? Math.max(1, Math.min(100, Math.trunc(parsedLimit)))
@@ -1361,6 +1528,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
+      const scoped = await scopeEntryToBranch(entry, requestedBranch(req));
       // Type-confusion guard (CodeQL js/type-confusion-through-parameter-tampering):
       // req.query.pattern is `string | string[] | ParsedQs` — without an explicit
       // type check, the `.length` guard below counts array elements instead of
@@ -1405,7 +1573,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const repoRoot = path.resolve(entry.path);
 
       // Get file paths from the graph (lightweight — no content loaded)
-      const lbugPath = path.join(entry.storagePath, 'lbug');
+      const lbugPath = scoped.lbugPath;
       const fileRows = await withLbugDb(
         lbugPath,
         () =>
@@ -1525,6 +1693,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           embeddings,
           dropEmbeddings,
           description,
+          branch,
         } = req.body;
 
         // Input type validation
@@ -1538,6 +1707,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         }
         if (description !== undefined && typeof description !== 'string') {
           res.status(400).json({ error: '"description" must be a string' });
+          return;
+        }
+        if (branch !== undefined && typeof branch !== 'string') {
+          res.status(400).json({ error: '"branch" must be a string' });
           return;
         }
 
@@ -1575,6 +1748,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         const trimmedDescription =
           typeof description === 'string' && description.trim() ? description.trim() : undefined;
+        const trimmedBranch =
+          typeof branch === 'string' && branch.trim() ? branch.trim() : undefined;
 
         // Start async work — don't await
         (async () => {
@@ -1607,6 +1782,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               embeddings,
               dropEmbeddings,
               ...(trimmedDescription ? { description: trimmedDescription } : {}),
+              ...(trimmedBranch ? { branch: trimmedBranch } : {}),
             });
           } catch (err: any) {
             if (targetPath) releaseRepoLock(getStoragePath(targetPath));
