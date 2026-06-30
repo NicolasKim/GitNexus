@@ -54,8 +54,8 @@ interface SSESession {
   lastActivity: number;
 }
 
-/** Sessions idle longer than this are evicted. */
-const SESSION_TTL_MS = 30 * 60 * 1000;
+/** Sessions idle longer than this are evicted. Infinity = no timeout (client holds session until it disconnects). */
+const SESSION_TTL_MS = Infinity;
 /** Cleanup sweep runs every 5 minutes. */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 /** Hard cap on concurrent sessions — guards against initialize-flood DoS. */
