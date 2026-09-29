@@ -249,13 +249,17 @@ describe('HTTP embedding backend', () => {
       });
       vi.stubGlobal(
         'fetch',
-        vi.fn().mockResolvedValueOnce(makeResp(256)).mockResolvedValueOnce(makeResp(14)),
+        vi
+          .fn()
+          .mockResolvedValueOnce(makeResp(128))
+          .mockResolvedValueOnce(makeResp(128))
+          .mockResolvedValueOnce(makeResp(14)),
       );
 
       const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
       const results = await embedBatch(Array.from({ length: 270 }, (_, i) => `text ${i}`));
 
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenCalledTimes(3);
       expect(results).toHaveLength(270);
     });
 
@@ -271,20 +275,26 @@ describe('HTTP embedding backend', () => {
       });
       vi.stubGlobal(
         'fetch',
-        vi.fn().mockResolvedValueOnce(makeResp(256)).mockResolvedValueOnce(makeResp(14)),
+        vi
+          .fn()
+          .mockResolvedValueOnce(makeResp(128))
+          .mockResolvedValueOnce(makeResp(128))
+          .mockResolvedValueOnce(makeResp(14)),
       );
 
       const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
       const results = await embedBatch(Array.from({ length: 270 }, (_, i) => `text ${i}`));
 
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenCalledTimes(3);
       expect(results).toHaveLength(270);
 
-      // Verify dimensions is sent in BOTH batch requests
+      // Verify dimensions is sent in ALL batch requests
       const body0 = JSON.parse((fetch as any).mock.calls[0][1].body);
       const body1 = JSON.parse((fetch as any).mock.calls[1][1].body);
+      const body2 = JSON.parse((fetch as any).mock.calls[2][1].body);
       expect(body0.dimensions).toBe(512);
       expect(body1.dimensions).toBe(512);
+      expect(body2.dimensions).toBe(512);
     });
 
     it('rejects non-numeric GITNEXUS_EMBEDDING_DIMS values', async () => {

@@ -17,7 +17,7 @@ import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from '
 const HTTP_TIMEOUT_MS = 120_000;
 const HTTP_MAX_RETRIES = 2;
 const HTTP_RETRY_BACKOFF_MS = 1_000;
-const HTTP_BATCH_SIZE = 256;
+const HTTP_BATCH_SIZE = 64;
 const DEFAULT_DIMS = 1024;
 const HTTP_BREAKER_KEY = 'embeddings-http';
 
@@ -171,9 +171,24 @@ const httpEmbedBatch = async (
 
   if (!resp.ok) {
     // resilientFetch already retried 5xx/429; any non-OK response here is
-    // a terminal client error (4xx other than 429).
+    // a terminal client error (4xx other than 429). Capture the response
+    // body so we can diagnose input-validation errors (e.g. Voyage 400 on
+    // an empty or oversized text in a batch).
+    let errorBody = '';
+    try {
+      errorBody = await resp.text();
+    } catch {
+      // Secondary read errors are not fatal; keep the original status-focused
+      // error if the body cannot be read.
+    }
+    if (errorBody) {
+      console.error(
+        `Embedding endpoint ${resp.status} body (${safeUrl(url)}, batch ${batchIndex}): ${errorBody.slice(0, 2000)}`,
+      );
+    }
+    const bodyHint = errorBody ? `: ${errorBody.slice(0, 500)}` : '';
     throw new Error(
-      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})`,
+      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})${bodyHint}`,
     );
   }
 

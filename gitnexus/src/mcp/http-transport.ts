@@ -54,8 +54,19 @@ interface SSESession {
   lastActivity: number;
 }
 
-/** Sessions idle longer than this are evicted. Infinity = no timeout (client holds session until it disconnects). */
-const SESSION_TTL_MS = Infinity;
+/**
+ * Sessions idle longer than this are evicted.
+ *
+ * Must stay finite: a client that dies without sending DELETE (crashed IDE,
+ * SIGKILLed agent process, container restart, dropped network) leaves its
+ * session in the map with nothing left to reclaim it — `transport.onclose`
+ * never fires. Sessions then only accumulate, and once MAX_SESSIONS is reached
+ * every new `initialize` gets a 503 that no amount of retrying clears until the
+ * server restarts. 24h is long enough that no live session is evicted mid-use
+ * (the previous 30min was short enough to kill idle-but-live clients, which is
+ * why it was raised to Infinity), while leaked sessions still self-reclaim daily.
+ */
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 /** Cleanup sweep runs every 5 minutes. */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 /** Hard cap on concurrent sessions — guards against initialize-flood DoS. */

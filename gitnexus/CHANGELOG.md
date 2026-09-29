@@ -4,6 +4,10 @@ All notable changes to GitNexus will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`read_source` MCP tool** — read original source from the analyzed checkout by `file_path` plus an optional 1-based line range. The graph's symbol `content` is capped at 5000 chars and whitespace-flattened (newlines/tabs collapsed for the FTS tokenizer), so it is not usable code; `read_source` returns the file as written, with real indentation and line breaks. A range over 128KB is rejected with its byte count and the file's total line count rather than silently truncated.
+
 ## [1.6.9] - 2026-07-04
 
 ### Added
