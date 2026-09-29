@@ -37,7 +37,7 @@ describe('scopeEntryToBranch', () => {
   it('returns flat paths when branch is omitted', async () => {
     const scoped = await scopeEntryToBranch(entry);
     expect(scoped.lbugPath).toBe('/tmp/demo/.gitnexus/lbug');
-    expect(scoped.metaPath).toBe('/tmp/demo/.gitnexus/meta.json');
+    expect(scoped.metaPath).toBe('/tmp/demo/.gitnexus/gitnexus.json');
   });
 
   it('returns primary branch flat paths when branch matches entry.branch', async () => {

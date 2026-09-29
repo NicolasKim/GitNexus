@@ -30,8 +30,8 @@ export const en = {
   'status.currentCommit': 'Current commit',
   'status.branch': 'Branch',
   'status.detached': '(detached HEAD)',
-  'status.branchNotIndexed':
-    "⚠️ current branch not indexed (primary index is for '{{primary}}'; run gitnexus analyze)",
+  'status.workspaceIndexLabel':
+    "Workspace index: last analyzed on '{{primary}}' (re-run gitnexus analyze to follow the current branch)",
   'status.status': 'Status',
   'status.upToDate': '✅ up-to-date',
   'status.stale': '⚠️ stale (re-run gitnexus analyze)',
@@ -53,7 +53,7 @@ export const en = {
   'remove.removed': 'Removed: {{name}}',
   'remove.failed': 'Failed to remove {{name}}: {{message}}',
   'tool.noIndexed': 'GitNexus: No indexed repositories found. Run: gitnexus analyze',
-  'tool.usage.query': 'Usage: gitnexus query <search_query>',
+  'tool.usage.query': 'Usage: gitnexus query [search_query]  or  gitnexus query --query <text>',
   'tool.usage.context': 'Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]',
   'tool.usage.impact':
     'Usage: gitnexus impact <symbol_name> [--uid <uid>] [--file <path>] [--kind <kind>] [--direction upstream|downstream]',
@@ -202,7 +202,7 @@ export const en = {
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',
   'help.option.analyze.embeddingDevice': 'Embedding device: auto, cpu, dml, cuda, or wasm',
-  'help.option.index.force': 'Register even if meta.json is missing (stats will be empty)',
+  'help.option.index.force': 'Register even if index metadata is missing (stats will be empty)',
   'help.option.index.allowNonGit': 'Allow registering folders that are not Git repositories',
   'help.option.port': 'Port number',
   'help.option.serve.host': 'Bind address (default: 127.0.0.1, use 0.0.0.0 for remote access)',
@@ -214,7 +214,7 @@ export const en = {
   'help.option.force.confirmation': 'Skip confirmation prompt',
   'help.option.uninstall.force': 'Apply the changes (default is a dry-run preview)',
   'help.option.clean.all': 'Clean all indexed repos',
-  'help.option.clean.branch': 'Delete only the named branch index (not the primary)',
+  'help.option.clean.branch': 'Delete only the named branch index (not the workspace index)',
   'help.option.clean.lbugSidecars': 'Clean quarantined LadybugDB missing-shadow WAL sidecars',
   'help.option.wiki.force': 'Force full regeneration even if up to date',
   'help.option.wiki.provider':
@@ -246,12 +246,15 @@ export const en = {
   'help.option.branch': 'Scope to a specific branch index (multi-branch repos)',
   'help.option.context.uid': 'Direct symbol UID (zero-ambiguity lookup)',
   'help.option.context.file': 'File path to disambiguate common names',
+  'help.option.context.limit': 'Max callers/callees/processes to return',
+  'help.option.query.flag': 'Search query (alias for positional argument)',
   'help.option.impact.kind':
     'Kind filter to disambiguate common names (e.g. Function, Class, Method)',
   'help.option.impact.direction': 'upstream (dependants) or downstream (dependencies)',
   'help.option.impact.depth': 'Max relationship depth (default: 3)',
   'help.option.impact.includeTests': 'Include test files in results',
-  'help.option.impact.limit': 'Max symbols per depth level (default: 100)',
+  'help.option.impact.limit':
+    'Max symbols per depth level and affected processes/modules to return (default: 100)',
   'help.option.impact.offset': 'Skip N symbols per depth level for pagination',
   'help.option.impact.summaryOnly': 'Return counts and risk only, omit symbol list',
   'help.option.trace.fromUid': 'Source symbol UID (zero-ambiguity lookup)',
@@ -262,6 +265,8 @@ export const en = {
   'help.option.trace.includeTests': 'Traverse through test-file symbols (default: false)',
   'help.option.detectChanges.scope': 'What to analyze: unstaged, staged, all, or compare',
   'help.option.detectChanges.baseRef': 'Branch/commit for compare scope (e.g. main)',
+  'help.option.detectChanges.limit': 'Max changed symbols to return',
+  'help.option.cypher.limit': 'Max result rows to return',
   'help.option.check.cycles': 'Detect circular imports and fail when any are found',
   'help.option.evalServer.host':
     'Bind address (default: 127.0.0.1, use 0.0.0.0 to expose to all interfaces)',
@@ -287,5 +292,5 @@ export const en = {
   'help.option.group.contracts.repo': 'Filter by repo',
   'help.option.group.contracts.unmatched': 'Show only unmatched contracts',
   'help.analyze.environment':
-    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.\n  GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=N  Worker idle timeout in milliseconds. Default 30000.\n  GITNEXUS_WAL_CHECKPOINT_THRESHOLD=N  LadybugDB WAL auto-checkpoint threshold in bytes (default 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).\n  GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES=N  Worker job byte budget. Default 8388608.\n  GITNEXUS_WORKER_POOL_SIZE=N  Parse worker count override. Default cores-1 capped at 16.\n  GITNEXUS_PARSE_CHUNK_CONCURRENCY=N  Concurrent in-flight parse chunks. Default 2.\n  GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT=N  Max replacement spawns per slot before drop. Default 3.\n  GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS=N  Total retry wall-time per job. Default 5x sub-batch timeout.\n  GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD=N  Per-slot deaths to trip circuit breaker. Default max(3, poolSize).\n  GITNEXUS_EMBEDDING_THREADS=N  Limit local ONNX CPU threads for --embeddings.\n  GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT=N  Max embedding chunks for exact-scan fallback. Default 10000.\n\nFlags override the corresponding env vars when both are provided.\n\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n     `!__tests__/` to index a directory that is auto-filtered by default (#771).',
+    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1   Skip .gitignore parsing (still reads .gitnexusignore)\n  GITNEXUS_MAX_FILE_SIZE=N  Override large-file skip threshold (KB). Default 512, max 32768.\n  GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=N  Worker idle timeout in milliseconds. Default 30000.\n  GITNEXUS_WAL_CHECKPOINT_THRESHOLD=N  LadybugDB WAL auto-checkpoint threshold in bytes (default 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).\n  GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES=N  Worker job byte budget. Default 8388608.\n  GITNEXUS_WORKER_POOL_SIZE=N  Parse worker count override. Default cores-1 capped at 16.\n  GITNEXUS_PARSE_CHUNK_CONCURRENCY=N  Concurrent in-flight parse chunks. Default 2.\n  GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT=N  Max replacement spawns per slot before drop. Default 3.\n  GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS=N  Total retry wall-time per job. Default 5x sub-batch timeout.\n  GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD=N  Per-slot deaths to trip circuit breaker. Default max(3, poolSize).\n  GITNEXUS_EMBEDDING_THREADS=N  Limit local ONNX CPU threads for --embeddings.\n  GITNEXUS_SEMANTIC_EXACT_SCAN_LIMIT=N  Max embedding chunks for exact-scan fallback. Default 10000.\n  GITNEXUS_VECTOR_MAX_DISTANCE=N  Max accepted semantic/vector cosine distance (0 < N <= 2; higher values clamp to 2). Default 0.6 for MCP, 0.5 elsewhere.\n\nFlags override the corresponding env vars when both are provided.\n\nTip: `.gitnexusignore` supports `.gitignore`-style negation. Add e.g.\n     `!__tests__/` to index a directory that is auto-filtered by default (#771).',
 } as const;

@@ -12,8 +12,9 @@ import { createClassExtractor } from '../class-extractors/generic.js';
 import { javaClassConfig } from '../class-extractors/configs/jvm.js';
 import { defineLanguage } from '../language-provider.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
 import { javaTypeConfig } from '../type-extractors/jvm.js';
-import { extractSpringRoutes } from '../route-extractors/spring.js';
+import { extractSpringRoutes, extractSpringTypes } from '../route-extractors/spring.js';
 import { javaExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
 import { javaImportConfig } from '../import-resolvers/configs/jvm.js';
@@ -117,6 +118,9 @@ export const javaProvider = defineLanguage({
   variableExtractor: createVariableExtractor(javaVariableConfig),
   classExtractor: createClassExtractor(javaClassConfig),
 
+  // ── Javadoc → description (issue #2270) ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor(),
+
   // ── RFC #909 Ring 3: scope-based resolution hooks ──
   emitScopeCaptures: emitJavaScopeCaptures,
 
@@ -134,4 +138,5 @@ export const javaProvider = defineLanguage({
 
   // ── Route extraction ──
   extractDecoratorRoutes: extractSpringRoutes,
+  extractRouteInheritanceTypes: extractSpringTypes,
 });

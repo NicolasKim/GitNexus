@@ -21,6 +21,20 @@ vi.mock('@huggingface/transformers', () => {
   };
 });
 
+/**
+ * Spy for the CUDA-13 build-matching resolver hook. Both local embedders must
+ * call this before importing transformers.js — mocked (rather than exercising
+ * the real resolver's env/subprocess probing) to keep this suite fast and
+ * platform-independent; `onnxruntime-node-resolver.test.ts` covers the
+ * resolver's own decision logic.
+ */
+const { resolverHookInstalled } = vi.hoisted(() => ({ resolverHookInstalled: vi.fn() }));
+
+vi.mock('../../src/core/embeddings/onnxruntime-node-resolver.js', () => ({
+  ensureOnnxRuntimeNodeMatchesSystem: () => resolverHookInstalled(),
+  isEffectiveCudaAvailable: () => false,
+}));
+
 const EMBED_ENV_KEYS = [
   'GITNEXUS_EMBEDDING_URL',
   'GITNEXUS_EMBEDDING_MODEL',
@@ -44,6 +58,7 @@ const stubPlatform = (platform: NodeJS.Platform, arch: NodeJS.Architecture): (()
 beforeEach(() => {
   vi.resetModules();
   transformersImported.mockClear();
+  resolverHookInstalled.mockClear();
   for (const key of EMBED_ENV_KEYS) delete process.env[key];
 });
 
@@ -190,7 +205,7 @@ describe('HTTP embedding mode on darwin/x64', () => {
   it('is not blocked by the local-runtime guard and never touches the native runtime', async () => {
     process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
     process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-    const mockVec = Array.from({ length: 384 }, (_, i) => i / 384);
+    const mockVec = Array.from({ length: 1024 }, (_, i) => i / 1024);
     // Size the response to the request's `input` length so both the single
     // (embedText) and batched (embedBatch) calls get matching vector counts.
     vi.stubGlobal(
@@ -214,7 +229,7 @@ describe('HTTP embedding mode on darwin/x64', () => {
 
       const single = await embedText('hello from macOS Intel');
       expect(single).toBeInstanceOf(Float32Array);
-      expect(single.length).toBe(384);
+      expect(single.length).toBe(1024);
 
       const batch = await embedBatch(['a', 'b']);
       expect(batch).toHaveLength(2);
@@ -232,7 +247,7 @@ describe('MCP embedQuery on darwin/x64', () => {
   it('routes HTTP mode through httpEmbedQuery without importing transformers.js', async () => {
     process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
     process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
-    const mockVec = Array.from({ length: 384 }, (_, i) => i / 384);
+    const mockVec = Array.from({ length: 1024 }, (_, i) => i / 1024);
     vi.stubGlobal(
       'fetch',
       vi.fn(async () => ({
@@ -246,10 +261,10 @@ describe('MCP embedQuery on darwin/x64', () => {
       const { embedQuery } = await import('../../src/mcp/core/embedder.js');
       const vec = await embedQuery('query from macOS Intel');
 
-      // httpEmbedQuery validates against the default 384 dims (no GITNEXUS_EMBEDDING_DIMS
-      // set), so the reused stub stays 384-length; resize the stub + DIMS together to vary it.
+      // httpEmbedQuery validates against this fork's default 1024 dims when
+      // GITNEXUS_EMBEDDING_DIMS is unset.
       expect(Array.isArray(vec)).toBe(true);
-      expect(vec).toHaveLength(384);
+      expect(vec).toHaveLength(1024);
       expect(fetch).toHaveBeenCalled();
       expect(transformersImported).not.toHaveBeenCalled();
     } finally {
@@ -265,6 +280,39 @@ describe('MCP embedQuery on darwin/x64', () => {
       const { embedQuery } = await import('../../src/mcp/core/embedder.js');
       await expect(embedQuery('query from macOS Intel')).rejects.toThrow(/macOS Intel/);
       expect(transformersImported).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+});
+
+describe('CUDA-13 resolver hook installation (both local-embedding entrypoints)', () => {
+  // Regression guard for the two local embedders drifting apart (gitnexus PR #2341
+  // follow-up): both `core/embeddings/embedder.ts` and `mcp/core/embedder.ts` must
+  // install the CUDA-build-matching redirect during a successful local init. (The
+  // source itself places the call before `await import('@huggingface/transformers')`
+  // — not re-asserted here via mock call-order, since the hoisted `@huggingface/
+  // transformers` mock's factory only fires once per file run for this external
+  // package, making a second per-test "called fresh" assertion on it unreliable.)
+  it('core embedder installs the resolver hook on a successful local init', async () => {
+    const restore = stubPlatform('linux', 'x64');
+    try {
+      const { initEmbedder } = await import('../../src/core/embeddings/embedder.js');
+      await expect(initEmbedder()).resolves.toBeDefined();
+
+      expect(resolverHookInstalled).toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it('MCP embedder installs the resolver hook on a successful local init', async () => {
+    const restore = stubPlatform('linux', 'x64');
+    try {
+      const { initEmbedder } = await import('../../src/mcp/core/embedder.js');
+      await expect(initEmbedder()).resolves.toBeDefined();
+
+      expect(resolverHookInstalled).toHaveBeenCalled();
     } finally {
       restore();
     }

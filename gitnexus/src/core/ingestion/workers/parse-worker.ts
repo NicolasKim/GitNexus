@@ -30,6 +30,7 @@ import { postResultCloneSafe } from './post-result.js';
 import { mergeResult } from './result-merge.js';
 import type { SymbolTableReader } from '../model/symbol-table.js';
 import type {
+  ExtractedRouterConstructorPrefix,
   ExtractedRouterInclude,
   ExtractedRouterImport,
   ExtractedRouterModuleAlias,
@@ -130,6 +131,7 @@ import {
   persistDurableParsedFileShardSync,
 } from '../../../storage/parsedfile-store.js';
 import { extractLaravelRoutes, type ExtractedRoute } from '../route-extractors/laravel.js';
+import type { SharedSpringType } from '../route-extractors/spring-shared.js';
 import {
   collectFunctionCfgs,
   DEFAULT_PDG_MAX_FUNCTION_LINES,
@@ -317,6 +319,16 @@ export interface ExtractedDecoratorRoute {
    * absent ⇒ no prefix applies.
    */
   prefix?: string | null;
+  /**
+   * Name of the handler the route decorator sits on (the decorated
+   * method/function — e.g. `create` for `@PostMapping("/orders") Order create()`).
+   * Captured at extraction where the decorated definition node is in hand, so
+   * the routes phase can resolve it to a real handler symbol UID via the
+   * SemanticModel (same `(filePath, name) → nodeId` lookup Laravel routes use).
+   * Absent when the extractor could not identify the decorated definition;
+   * resolution then falls back (the Route node simply carries no handlerSymbolId).
+   */
+  handlerName?: string;
 }
 
 export interface ExtractedToolDef {
@@ -383,6 +395,16 @@ export interface ParseWorkerResult {
   decoratorRoutes: ExtractedDecoratorRoute[];
   routerIncludes: ExtractedRouterInclude[];
   routerImports: ExtractedRouterImport[];
+  routerConstructorPrefixes?: ExtractedRouterConstructorPrefix[];
+  /**
+   * Optional. Project-wide `SharedSpringType` view of route-defining
+   * class/interface declarations, produced by the provider's
+   * `extractRouteInheritanceTypes` hook (Java/Spring). parse-impl aggregates
+   * these and runs a cross-file pass that resolves interface-inherited routes
+   * into additional `decoratorRoutes` (#2288). Optional for cache backward
+   * compatibility; consumers must guard with `?? []`.
+   */
+  springTypes?: SharedSpringType[];
   /**
    * Optional. `from <pkg> import <module>` records from Python files
    * where `<module>` is later used as a Shape-A include receiver
@@ -886,6 +908,7 @@ const processBatch = (
     decoratorRoutes: [],
     routerIncludes: [],
     routerImports: [],
+    routerConstructorPrefixes: [],
     routerModuleAliases: [],
     toolDefs: [],
     ormQueries: [],
@@ -966,8 +989,13 @@ const processBatch = (
         try {
           setLanguage(language, regularFiles[0].path);
           processFileGroup(regularFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
+        } catch (err) {
+          // A throw here drops the whole language group — surface it to the pool
+          // (#2264) instead of silently skipping. The old empty catch hid real
+          // extractor/parser failures, not just an unavailable grammar.
+          reportWarning(
+            `Skipped ${regularFiles.length} ${language} file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       } else {
         result.skippedLanguages[language] =
@@ -981,8 +1009,12 @@ const processBatch = (
         try {
           setLanguage(language, tsxFiles[0].path);
           processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
-        } catch {
-          // parser unavailable — skip this language group
+        } catch (err) {
+          // See above — surface a tsx-group processing failure rather than
+          // silently dropping every file in it (#2264).
+          reportWarning(
+            `Skipped ${tsxFiles.length} ${language} (tsx) file(s) after a processing error: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       } else {
         result.skippedLanguages[language] =
@@ -1142,6 +1174,23 @@ export function extractORMQueries(
 
 import { extractFastAPIRouterBindings } from '../route-extractors/fastapi-router-bindings.js';
 
+/**
+ * Report a non-fatal worker issue to the pool over IPC so a caught error is not
+ * invisible to the operator (#2264). The pool logs it on the main thread AND
+ * resets the worker idle timer (so a worker grinding through failing files isn't
+ * falsely idle-evicted). Falls back to the local logger when there's no parent —
+ * this code also runs on the main thread in tests / the non-worker path. Fatal,
+ * group-aborting errors go through the message handler's
+ * `{ type: 'error', errorStack }` channel instead.
+ */
+function reportWarning(message: string): void {
+  if (parentPort) {
+    parentPort.postMessage({ type: 'warning', message });
+  } else {
+    logger.warn(message);
+  }
+}
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -1154,12 +1203,9 @@ const processFileGroup = (
     const lang = parser.getLanguage();
     query = new Parser.Query(lang, queryString);
   } catch (err) {
-    const message = `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`;
-    if (parentPort) {
-      parentPort.postMessage({ type: 'warning', message });
-    } else {
-      logger.warn(message);
-    }
+    reportWarning(
+      `Query compilation failed for ${language}: ${err instanceof Error ? err.message : String(err)}`,
+    );
     return;
   }
 
@@ -1203,7 +1249,7 @@ const processFileGroup = (
         bufferSize: getTreeSitterBufferSize(parseContent),
       });
     } catch (err) {
-      logger.warn(
+      reportWarning(
         `Failed to parse file ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
       );
       continue;
@@ -1216,7 +1262,7 @@ const processFileGroup = (
     try {
       matches = query.matches(tree.rootNode);
     } catch (err) {
-      logger.warn(
+      reportWarning(
         `Query execution failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
       );
       continue;
@@ -1237,13 +1283,7 @@ const processFileGroup = (
       provider,
       parseContent,
       file.path,
-      (message) => {
-        if (parentPort) {
-          parentPort.postMessage({ type: 'warning', message });
-        } else {
-          logger.warn(message);
-        }
-      },
+      reportWarning,
       tree,
       scopeSourceKind,
     );
@@ -1306,9 +1346,9 @@ const processFileGroup = (
             };
           }
         } catch (err) {
-          const message = `CFG build failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`;
-          if (parentPort) parentPort.postMessage({ type: 'warning', message });
-          else logger.warn(message);
+          reportWarning(
+            `CFG build failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
 
@@ -1658,6 +1698,13 @@ const processFileGroup = (
                         : routedFieldInfo?.type
                           ? { declaredType: routedFieldInfo.type }
                           : {}),
+                      ...(routedFieldInfo?.rawDeclaredType !== undefined
+                        ? { rawDeclaredType: routedFieldInfo.rawDeclaredType }
+                        : {}),
+                      ...(routedFieldInfo?.annotations !== undefined &&
+                      routedFieldInfo.annotations.length > 0
+                        ? { annotations: routedFieldInfo.annotations }
+                        : {}),
                       ...(routedFieldInfo?.visibility !== undefined
                         ? { visibility: routedFieldInfo.visibility }
                         : {}),
@@ -2109,7 +2156,12 @@ const processFileGroup = (
           if (parsedTemplateConstraints !== undefined) {
             constraintsTag = templateConstraintsIdTag(parsedTemplateConstraints);
           }
-        } catch {
+        } catch (err) {
+          // Optional C++ template-constraint enrichment: fall back to no tag, but
+          // surface the failure (#2264) — matches the CFG-build warning above.
+          reportWarning(
+            `Template-constraint extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+          );
           parsedTemplateConstraints = undefined;
           constraintsTag = '';
         }
@@ -2119,7 +2171,20 @@ const processFileGroup = (
         `${file.path}:${qualifiedName}${classTemplateTag}${arityTag}${parameterShapeTag}${constraintsTag}`,
       );
 
-      const description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      let description: string | undefined;
+      try {
+        description = provider.descriptionExtractor?.(nodeLabel, nodeName, captureMap);
+      } catch (err) {
+        // A throw here (an unexpected tree-sitter node shape, a provider bug) must
+        // NOT propagate — it would escape processFileGroup to the language-group
+        // catch, which treats any throw as "parser unavailable" and silently drops
+        // every remaining file in the group. Mirrors the extractTemplateConstraints
+        // guard above (#2286 review).
+        reportWarning(
+          `Description extraction failed for ${file.path}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        description = undefined;
+      }
 
       let frameworkHint = definitionNode
         ? detectFrameworkFromAST(language, (definitionNode.text || '').slice(0, 300))
@@ -2191,6 +2256,15 @@ const processFileGroup = (
             const info = fieldMap?.get(nodeName);
             if (info) {
               declaredType = info.type ?? undefined;
+              // Mutate methodProps BEFORE the `{...methodProps}` spread below —
+              // rawDeclaredType is the verbatim generic type text (U1, PR #2200).
+              if (info.rawDeclaredType !== undefined) {
+                methodProps.rawDeclaredType = info.rawDeclaredType;
+              }
+              // Field annotations ('@Name' strings, U2 PR #2200) — omit when empty.
+              if (info.annotations !== undefined && info.annotations.length > 0) {
+                methodProps.annotations = info.annotations;
+              }
               methodProps.visibility = info.visibility;
               methodProps.isStatic = info.isStatic;
               methodProps.isReadonly = info.isReadonly;
@@ -2368,6 +2442,7 @@ const processFileGroup = (
         result.routerIncludes,
         result.routerImports,
         (result.routerModuleAliases ??= []),
+        (result.routerConstructorPrefixes ??= []),
       );
     }
 
@@ -2378,6 +2453,14 @@ const processFileGroup = (
     if (provider.extractDecoratorRoutes) {
       const frameworkRoutes = provider.extractDecoratorRoutes(tree, file.path, lineOffset);
       for (const r of frameworkRoutes) result.decoratorRoutes.push(r);
+    }
+
+    // Project-wide route-inheritance type collection via provider hook (#2288).
+    // The per-file SharedSpringType views are aggregated by the parse phase,
+    // which then resolves interface-inherited routes cross-file.
+    if (provider.extractRouteInheritanceTypes) {
+      const springTypes = provider.extractRouteInheritanceTypes(tree, file.path);
+      if (springTypes.length > 0) (result.springTypes ??= []).push(...springTypes);
     }
 
     // Vue: emit CALLS edges for components used in <template>
@@ -2412,6 +2495,7 @@ let accumulated: ParseWorkerResult = {
   decoratorRoutes: [],
   routerIncludes: [],
   routerImports: [],
+  routerConstructorPrefixes: [],
   routerModuleAliases: [],
   toolDefs: [],
   ormQueries: [],
@@ -2552,6 +2636,7 @@ parentPort!.on('message', (msg: WorkerIncomingMessage) => {
         decoratorRoutes: [],
         routerIncludes: [],
         routerImports: [],
+        routerConstructorPrefixes: [],
         routerModuleAliases: [],
         toolDefs: [],
         ormQueries: [],

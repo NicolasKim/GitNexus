@@ -101,7 +101,7 @@ withTestLbugDB(
     // reinit under concurrent query load) hung for WAITER_TIMEOUT_MS (15s) and
     // then surfaced a misleading "pool exhausted" error. Now they reject
     // immediately with an actionable "pool closed" message. The pool caps at
-    // MAX_CONNS_PER_REPO (8); firing a synchronous burst larger than that queues
+    // MAX_CONNS_PER_REPO (16 in this fork); firing a synchronous burst larger than that queues
     // the surplus as waiters, and closing synchronously (before any query
     // settles) must reject every queued waiter at once. The default 5s test
     // timeout also guards promptness — a regression would block ~15s and time
@@ -110,11 +110,11 @@ withTestLbugDB(
       it('rejects queued waiters promptly with a pool-closed error on close', async () => {
         await initLbug('test-repo', handle.dbPath);
 
-        // Fire a burst larger than the 8-connection cap WITHOUT awaiting: the
-        // first 8 check out connections synchronously, the surplus queue as
+        // Fire a burst larger than the 16-connection cap WITHOUT awaiting: the
+        // first 16 check out connections synchronously, the surplus queue as
         // waiters — all before the synchronous closeLbug below runs.
         const BURST = 24;
-        const MAX_CONNS = 8;
+        const MAX_CONNS = 16;
         const inflight = Array.from({ length: BURST }, () =>
           executeQuery('test-repo', 'MATCH (n:Function) RETURN n.name AS name'),
         );

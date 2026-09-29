@@ -4,20 +4,26 @@
  * Tests: streamAllCSVsToDisk with real graph data.
  * Covers hardening fixes: LRU cache (#24), BufferedCSVWriter flush
  */
-import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import fs from 'fs/promises';
+import { readdirSync } from 'node:fs';
 import { finished } from 'stream/promises';
 import path from 'path';
+import { constants as bufferConstants } from 'node:buffer';
 import { createTempDir, type TestDBHandle } from '../helpers/test-db.js';
 import { buildTestGraph, type TestNodeInput, type TestRelInput } from '../helpers/test-graph.js';
 import {
   streamAllCSVsToDisk,
   buildRelRow,
   REL_CSV_HEADER,
+  shouldFlushCSVBuffer,
+  FLUSH_BYTES,
 } from '../../src/core/lbug/csv-generator.js';
 import { splitRelCsvByLabelPair } from '../../src/core/lbug/lbug-adapter.js';
 import { getNodeLabel } from '../../src/core/lbug/rel-pair-routing.js';
 import { NODE_TABLES } from '../../src/core/lbug/schema.js';
+import { TREE_SITTER_MAX_BUFFER } from '../../src/core/ingestion/constants.js';
+import { CJK_BIGRAM_WORST_CASE_GROWTH_FACTOR } from '../../src/core/search/cjk-segmentation.js';
 
 let tmpHandle: TestDBHandle;
 let csvDir: string;
@@ -165,6 +171,125 @@ describe('streamAllCSVsToDisk', () => {
     expect(content).toContain('"index.ts"');
   });
 
+  it('keeps full text file content searchable past 10KB', async () => {
+    const lateNeedle = 'late_text_file_needle_after_10kb';
+    await fs.writeFile(
+      path.join(repoDir, 'src', 'large.txt'),
+      `${'filler line for large text indexing\n'.repeat(400)}${lateNeedle}\n`,
+    );
+    const graph = buildTestGraph([
+      {
+        id: 'file:src/large.txt',
+        label: 'File',
+        name: 'large.txt',
+        filePath: 'src/large.txt',
+      },
+    ]);
+
+    const result = await streamAllCSVsToDisk(graph, repoDir, csvDir);
+    const fileCsv = result.nodeFiles.get('File');
+    expect(fileCsv).toBeDefined();
+
+    const content = await fs.readFile(fileCsv!.csvPath, 'utf-8');
+    expect(content).toContain(lateNeedle);
+    expect(content).not.toContain('[truncated]');
+  });
+
+  describe('GITNEXUS_FTS_CJK_SEGMENTATION (#2331)', () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    // The description phrase is deliberately different from anything in the
+    // file's own source text (and the function's startLine/endLine keep the
+    // extracted content snippet away from the file-level comment). If
+    // description and content were segmented via the same accidental code
+    // path, or formatFtsDescription silently used the wrong property, a
+    // description-only phrase could not appear in either CSV row.
+    const FILE_CJK_PHRASE = '采购订单自动审批流程';
+    const DESCRIPTION_CJK_PHRASE = '库存管理系统更新';
+
+    it('leaves File content and Function description byte-identical by default (mode: none)', async () => {
+      const cjkContent = `// ${FILE_CJK_PHRASE}\nexport function approve() {\n  return true;\n}\n`;
+      await fs.writeFile(path.join(repoDir, 'src', 'cjk.ts'), cjkContent);
+      const graph = buildTestGraph([
+        { id: 'file:src/cjk.ts', label: 'File', name: 'cjk.ts', filePath: 'src/cjk.ts' },
+        {
+          id: 'func:approve',
+          label: 'Function',
+          name: 'approve',
+          filePath: 'src/cjk.ts',
+          extra: { description: DESCRIPTION_CJK_PHRASE, startLine: 3, endLine: 3 },
+        },
+      ]);
+
+      const result = await streamAllCSVsToDisk(graph, repoDir, csvDir);
+      const fileContent = await fs.readFile(result.nodeFiles.get('File')!.csvPath, 'utf-8');
+      const funcContent = await fs.readFile(result.nodeFiles.get('Function')!.csvPath, 'utf-8');
+      expect(fileContent).toContain(FILE_CJK_PHRASE);
+      expect(funcContent).toContain(DESCRIPTION_CJK_PHRASE);
+      expect(funcContent).not.toContain(FILE_CJK_PHRASE);
+      // No bigram-separator spaces inserted into the CJK run.
+      expect(fileContent).not.toContain('采购 购订');
+      expect(funcContent).not.toContain('库存 存管');
+    });
+
+    it('bigram-segments both File content and Function description when enabled', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const cjkContent = `// ${FILE_CJK_PHRASE}\nexport function approve() {\n  return true;\n}\n`;
+      await fs.writeFile(path.join(repoDir, 'src', 'cjk-bigram.ts'), cjkContent);
+      const graph = buildTestGraph([
+        {
+          id: 'file:src/cjk-bigram.ts',
+          label: 'File',
+          name: 'cjk-bigram.ts',
+          filePath: 'src/cjk-bigram.ts',
+        },
+        {
+          id: 'func:approve-bigram',
+          label: 'Function',
+          name: 'approveBigram',
+          filePath: 'src/cjk-bigram.ts',
+          extra: { description: DESCRIPTION_CJK_PHRASE, startLine: 3, endLine: 3 },
+        },
+      ]);
+
+      const result = await streamAllCSVsToDisk(graph, repoDir, csvDir);
+      const fileContent = await fs.readFile(result.nodeFiles.get('File')!.csvPath, 'utf-8');
+      const funcContent = await fs.readFile(result.nodeFiles.get('Function')!.csvPath, 'utf-8');
+      // Every expected overlapping bigram from the issue's own example must
+      // be present as a real, space-delimited FTS token in the File row.
+      const expectedFileBigrams = [
+        '采购',
+        '购订',
+        '订单',
+        '单自',
+        '自动',
+        '动审',
+        '审批',
+        '批流',
+        '流程',
+      ];
+      for (const bigram of expectedFileBigrams) {
+        expect(fileContent).toContain(bigram);
+      }
+      // The Function row's description column is segmented independently —
+      // proven against its own (distinct) phrase, not the file's.
+      const expectedDescriptionBigrams = ['库存', '存管', '管理', '理系', '系统', '统更', '更新'];
+      for (const bigram of expectedDescriptionBigrams) {
+        expect(funcContent).toContain(bigram);
+      }
+      // #2339: every one of the bigram substrings above is ALSO a literal
+      // substring of the original unsegmented phrase (bigrams are
+      // overlapping substrings by construction), so the positive assertions
+      // alone would pass even if applyCjkSegmentationIfEnabled silently
+      // became a no-op. Mirror the `mode: none` test's negative-assertion
+      // pattern above: the original contiguous run must NOT survive intact.
+      expect(fileContent).not.toContain(FILE_CJK_PHRASE);
+      expect(funcContent).not.toContain(DESCRIPTION_CJK_PHRASE);
+    });
+  });
+
   it('handles community nodes with keywords', async () => {
     const graph = buildTestGraph([
       {
@@ -254,17 +379,21 @@ describe('streamAllCSVsToDisk', () => {
     expect(fileCsv!.rows).toBe(1);
   });
 
-  it('crosses the BufferedCSVWriter FLUSH_EVERY boundary without losing rows', async () => {
-    // FLUSH_EVERY=500; a >500-node graph forces ≥1 mid-stream flush, exercising
-    // addRow's flush-promise return + the loop's `if (pending) await pending`
-    // path that the small fixtures above never reach (only the bench did).
-    const N = 600;
-    const nodes = Array.from({ length: N }, (_, i) => ({
-      id: `File:src/f${i}.ts`,
-      label: 'File' as const,
-      name: `f${i}.ts`,
-      filePath: `src/f${i}.ts`,
-    }));
+  it('crosses the BufferedCSVWriter FLUSH_BYTES boundary without losing rows', async () => {
+    // FLUSH_BYTES=8MB; real File content totalling >8MB forces ≥1 mid-stream
+    // flush, exercising addRow's flush-promise return + the loop's
+    // `if (pending) await pending` path that the small fixtures above never
+    // reach (only the bench did).
+    const N = 10;
+    const CONTENT_SIZE = 1024 * 1024; // 1MB/file, 10MB total > FLUSH_BYTES
+    const bigContent = 'x'.repeat(CONTENT_SIZE);
+    await fs.mkdir(path.join(repoDir, 'src', 'big'), { recursive: true });
+    const nodes: TestNodeInput[] = [];
+    for (let i = 0; i < N; i++) {
+      const filePath = `src/big/f${i}.ts`;
+      await fs.writeFile(path.join(repoDir, filePath), bigContent);
+      nodes.push({ id: `File:${filePath}`, label: 'File', name: `f${i}.ts`, filePath });
+    }
     const result = await streamAllCSVsToDisk(buildTestGraph(nodes), repoDir, csvDir);
 
     const fileCsv = result.nodeFiles.get('File');
@@ -273,6 +402,25 @@ describe('streamAllCSVsToDisk', () => {
     const dataRows = dataRowsOf(await fs.readFile(fileCsv!.csvPath, 'utf-8'));
     expect(dataRows).toHaveLength(N);
     expect(new Set(dataRows).size).toBe(N); // all distinct — no flush-boundary corruption
+  });
+
+  it('flushes the buffered CSV chunk once the byte threshold is reached', () => {
+    expect(shouldFlushCSVBuffer(FLUSH_BYTES - 1)).toBe(false);
+    expect(shouldFlushCSVBuffer(FLUSH_BYTES)).toBe(true);
+  });
+
+  it('shouldFlushCSVBuffer stays within the V8 string-length ceiling', () => {
+    // One more max-size row (TREE_SITTER_MAX_BUFFER, hard-clamped — see
+    // max-file-size.ts) can land right after the buffer was just under
+    // FLUSH_BYTES. Two transforms can each grow that row before it's joined:
+    // applyCjkSegmentationIfEnabled (#2331, ~7/3x worst case on an all-CJK
+    // row with GITNEXUS_FTS_CJK_SEGMENTATION=bigram) and escapeCSVField's
+    // quote-doubling (2x). The resulting join() must stay well under Node's
+    // MAX_STRING_LENGTH, or BufferedCSVWriter.flush() throws
+    // `RangeError: Invalid string length`.
+    const worstCaseJoinSize =
+      FLUSH_BYTES + 2 * CJK_BIGRAM_WORST_CASE_GROWTH_FACTOR * TREE_SITTER_MAX_BUFFER;
+    expect(worstCaseJoinSize).toBeLessThan(bufferConstants.MAX_STRING_LENGTH / 2);
   });
 });
 
@@ -563,5 +711,71 @@ describe('streamAllCSVsToDisk — direct per-pair emit matches the split oracle'
     } finally {
       delete process.env.GITNEXUS_SORT_GRAPH_OUTPUT;
     }
+  });
+});
+
+// The overlap leg (#2203) needs to start COPY-ing nodes while relationship CSVs
+// are still being written. streamAllCSVsToDisk exposes that boundary via an
+// onNodePhaseComplete callback. These tests pin the contract: it fires once,
+// after node CSVs exist and before any rel CSV does, and supplying it does not
+// change the emitted output.
+describe('onNodePhaseComplete hook (#2203 overlap boundary)', () => {
+  const hookGraph = () =>
+    buildTestGraph(
+      [
+        { id: 'File:src/index.ts', label: 'File', name: 'index.ts', filePath: 'src/index.ts' },
+        {
+          id: 'Function:src/index.ts:main:1',
+          label: 'Function',
+          name: 'main',
+          filePath: 'src/index.ts',
+          startLine: 1,
+          endLine: 3,
+        },
+      ],
+      [
+        {
+          sourceId: 'File:src/index.ts',
+          targetId: 'Function:src/index.ts:main:1',
+          type: 'DEFINES',
+        },
+      ],
+    );
+
+  it('fires exactly once, after node CSVs are flushed and before any rel CSV exists', async () => {
+    const hookCsvDir = path.join(tmpHandle.dbPath, 'csv-hook-timing');
+    let calls = 0;
+    let nodeCsvsPresent = false;
+    let relCsvsPresent = true;
+    let handedKeys: string[] = [];
+
+    const result = await streamAllCSVsToDisk(hookGraph(), repoDir, hookCsvDir, (nodeFiles) => {
+      calls++;
+      handedKeys = [...nodeFiles.keys()].sort();
+      const entries = readdirSync(hookCsvDir);
+      nodeCsvsPresent = entries.includes('file.csv') && entries.includes('function.csv');
+      relCsvsPresent = entries.some((f) => f.startsWith('rel_'));
+    });
+
+    expect(calls).toBe(1);
+    expect(nodeCsvsPresent).toBe(true);
+    // No relationship CSV may exist yet — the rel pass starts after the hook.
+    expect(relCsvsPresent).toBe(false);
+    // The manifest handed to the callback is the one returned to the caller.
+    expect(handedKeys).toEqual([...result.nodeFiles.keys()].sort());
+    expect(result.totalValidRels).toBe(1);
+  });
+
+  it('supplying the callback does not change the node manifest (no behavior change)', async () => {
+    const withDir = path.join(tmpHandle.dbPath, 'csv-hook-with');
+    const withoutDir = path.join(tmpHandle.dbPath, 'csv-hook-without');
+    const withCb = await streamAllCSVsToDisk(hookGraph(), repoDir, withDir, () => {});
+    const without = await streamAllCSVsToDisk(hookGraph(), repoDir, withoutDir);
+
+    const manifest = (r: typeof withCb) =>
+      [...r.nodeFiles.entries()].map(([k, v]) => `${k}:${v.rows}`).sort();
+    expect(manifest(withCb)).toEqual(manifest(without));
+    expect(withCb.totalValidRels).toBe(without.totalValidRels);
+    expect(withCb.skippedRels).toBe(without.skippedRels);
   });
 });

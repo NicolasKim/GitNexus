@@ -141,6 +141,34 @@ function resolveHostGuardForReapingTests(): string | null {
 
 // ─── Test fixtures: temporary .gitnexus directory ───────────────────
 
+function writeSelfTestingGuardWithMarkers(
+  guardPath: string,
+  markers: { lsof?: string; ps?: string },
+) {
+  fs.writeFileSync(
+    guardPath,
+    `#!/usr/bin/env node
+const fs = require('fs');
+const { spawnSync } = require('child_process');
+const args = process.argv.slice(2);
+const lsofMarker = ${JSON.stringify(markers.lsof ?? '')};
+const psMarker = ${JSON.stringify(markers.ps ?? '')};
+if (args.includes('exit 42')) process.exit(42);
+if (lsofMarker && args.includes('-nP')) fs.writeFileSync(lsofMarker, 'called');
+if (psMarker && args.includes('-p')) fs.writeFileSync(psMarker, 'called');
+const child = spawnSync(args[3], args.slice(4), {
+  encoding: 'utf-8',
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
+if (child.stdout) process.stdout.write(child.stdout);
+if (child.stderr) process.stderr.write(child.stderr);
+if (child.error) process.exit(127);
+process.exit(child.status ?? 0);
+`,
+    { mode: 0o755 },
+  );
+}
+
 let tmpDir: string;
 let gitNexusDir: string;
 
@@ -328,8 +356,16 @@ describe('windowsHide regression', () => {
     ['gitnexus/src/cli/setup.ts', path.resolve(__dirname, '..', '..', 'src', 'cli', 'setup.ts')],
     ['gitnexus/src/cli/wiki.ts', path.resolve(__dirname, '..', '..', 'src', 'cli', 'wiki.ts')],
     [
-      'gitnexus/src/core/embeddings/embedder.ts',
-      path.resolve(__dirname, '..', '..', 'src', 'core', 'embeddings', 'embedder.ts'),
+      'gitnexus/src/core/embeddings/onnxruntime-node-resolver.ts',
+      path.resolve(
+        __dirname,
+        '..',
+        '..',
+        'src',
+        'core',
+        'embeddings',
+        'onnxruntime-node-resolver.ts',
+      ),
     ],
     [
       'gitnexus/src/core/git-staleness.ts',
@@ -2030,19 +2066,35 @@ describe.skipIf(SKIP_LSOF_PATH)(
 
       it(`${label}: ENOENT lsof → augment still runs (fail-open)`, () => {
         const markerPath = path.join(os.tmpdir(), `gn-hook-enoent-${process.pid}-${label}`);
+        const lsofWrapMarkerPath = path.join(
+          os.tmpdir(),
+          `gn-hook-enoent-lsofwrap-${process.pid}-${label}`,
+        );
+        const psWrapMarkerPath = path.join(
+          os.tmpdir(),
+          `gn-hook-enoent-pswrap-${process.pid}-${label}`,
+        );
         const lbugPath = path.join(gitNexusDir, 'lbug');
         fs.writeFileSync(lbugPath, '');
         fs.rmSync(markerPath, { force: true });
+        fs.rmSync(lsofWrapMarkerPath, { force: true });
+        fs.rmSync(psWrapMarkerPath, { force: true });
         const binDir = createHookToolDir({
           gitnexusMarkerPath: markerPath,
           gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
           lsofOutput: '',
           psOutput: '',
         });
+        const guardPath = path.join(binDir, 'marker-guard');
+        writeSelfTestingGuardWithMarkers(guardPath, {
+          lsof: lsofWrapMarkerPath,
+          ps: psWrapMarkerPath,
+        });
         try {
           const env = {
             ...hookEnv(binDir),
             GITNEXUS_HOOK_LSOF_PATH: path.join(binDir, '__missing_lsof__'),
+            GITNEXUS_HOOK_TIMEOUT_PATH: guardPath,
           };
           const result = runHook(
             hookPath,
@@ -2058,8 +2110,12 @@ describe.skipIf(SKIP_LSOF_PATH)(
           const output = parseHookOutput(result.stdout);
           expect(output).not.toBeNull();
           expect(fs.existsSync(markerPath)).toBe(true);
+          expect(fs.existsSync(lsofWrapMarkerPath)).toBe(false);
+          expect(fs.existsSync(psWrapMarkerPath)).toBe(false);
         } finally {
           fs.rmSync(markerPath, { force: true });
+          fs.rmSync(lsofWrapMarkerPath, { force: true });
+          fs.rmSync(psWrapMarkerPath, { force: true });
           fs.rmSync(binDir, { recursive: true, force: true });
         }
       });
@@ -2472,19 +2528,37 @@ describe.skipIf(SKIP_LSOF_PATH)(
 
       it(`${label}: ps ENOENT → augment runs (ignore that PID)`, () => {
         const markerPath = path.join(os.tmpdir(), `gn-hook-pseno-${process.pid}-${label}`);
+        const lsofWrapMarkerPath = path.join(
+          os.tmpdir(),
+          `gn-hook-pseno-lsofwrap-${process.pid}-${label}`,
+        );
+        const psWrapMarkerPath = path.join(
+          os.tmpdir(),
+          `gn-hook-pseno-pswrap-${process.pid}-${label}`,
+        );
         const lbugPath = path.join(gitNexusDir, 'lbug');
         fs.writeFileSync(lbugPath, '');
         fs.rmSync(markerPath, { force: true });
+        fs.rmSync(lsofWrapMarkerPath, { force: true });
+        fs.rmSync(psWrapMarkerPath, { force: true });
         const binDir = createHookToolDir({
           gitnexusMarkerPath: markerPath,
           gitnexusStderr: '[GitNexus] 1 related symbol found:\n\nvalidateUser (src/auth.ts)\n',
           lsofOutput: '99905\n',
-          psOutput: '',
+          psOutputByPid: {
+            '99905': 'node /x/node_modules/gitnexus/dist/cli/index.js mcp\n',
+          },
+        });
+        const guardPath = path.join(binDir, 'marker-guard');
+        writeSelfTestingGuardWithMarkers(guardPath, {
+          lsof: lsofWrapMarkerPath,
+          ps: psWrapMarkerPath,
         });
         try {
           const env = {
             ...hookEnv(binDir),
             GITNEXUS_HOOK_PS_PATH: path.join(binDir, '__missing_ps__'),
+            GITNEXUS_HOOK_TIMEOUT_PATH: guardPath,
           };
           const result = runHook(
             hookPath,
@@ -2500,8 +2574,12 @@ describe.skipIf(SKIP_LSOF_PATH)(
           const output = parseHookOutput(result.stdout);
           expect(output).not.toBeNull();
           expect(fs.existsSync(markerPath)).toBe(true);
+          expect(fs.existsSync(lsofWrapMarkerPath)).toBe(true);
+          expect(fs.existsSync(psWrapMarkerPath)).toBe(false);
         } finally {
           fs.rmSync(markerPath, { force: true });
+          fs.rmSync(lsofWrapMarkerPath, { force: true });
+          fs.rmSync(psWrapMarkerPath, { force: true });
           fs.rmSync(binDir, { recursive: true, force: true });
         }
       });
@@ -2679,6 +2757,118 @@ describe('PostToolUse staleness detection (integration)', () => {
 
       const output = parseHookOutput(result.stdout);
       expect(output).not.toBeNull();
+    });
+  }
+});
+
+// ─── Integration: PostToolUse staleness detection with gitnexus.json ────
+// (the current primary metadata filename; meta.json is a dual-written
+// compatibility mirror — see repo-manager.ts's saveMeta/loadMeta)
+
+describe('PostToolUse staleness detection with gitnexus.json (integration)', () => {
+  for (const [label, hookPath] of [
+    ['CJS', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+  ] as const) {
+    it(`${label}: emits stale notification when HEAD differs from gitnexus.json`, () => {
+      const gitnexusJsonPath = path.join(gitNexusDir, 'gitnexus.json');
+      const metaJsonPath = path.join(gitNexusDir, 'meta.json');
+      fs.rmSync(metaJsonPath, { force: true });
+      fs.writeFileSync(
+        gitnexusJsonPath,
+        JSON.stringify({ lastCommit: 'aaaaaaa0000000000000000000000000deadbeef', stats: {} }),
+      );
+
+      try {
+        const result = runHook(hookPath, {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        });
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        expect(output!.additionalContext).toContain('stale');
+        expect(output!.additionalContext).toContain('aaaaaaa');
+      } finally {
+        fs.rmSync(gitnexusJsonPath, { force: true });
+        fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+      }
+    });
+
+    it(`${label}: silent when HEAD matches gitnexus.json lastCommit`, () => {
+      const gitnexusJsonPath = path.join(gitNexusDir, 'gitnexus.json');
+      const metaJsonPath = path.join(gitNexusDir, 'meta.json');
+      const head = getHeadCommit();
+      fs.rmSync(metaJsonPath, { force: true });
+      fs.writeFileSync(gitnexusJsonPath, JSON.stringify({ lastCommit: head, stats: {} }));
+
+      try {
+        const result = runHook(hookPath, {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        });
+
+        expect(result.stdout.trim()).toBe('');
+      } finally {
+        fs.rmSync(gitnexusJsonPath, { force: true });
+        fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+      }
+    });
+
+    it(`${label}: prefers gitnexus.json over meta.json when both are present (dual-write steady state)`, () => {
+      const gitnexusJsonPath = path.join(gitNexusDir, 'gitnexus.json');
+      const metaJsonPath = path.join(gitNexusDir, 'meta.json');
+      fs.writeFileSync(gitnexusJsonPath, JSON.stringify({ lastCommit: 'freshcommit', stats: {} }));
+      fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: 'stalecommit', stats: {} }));
+
+      try {
+        const result = runHook(hookPath, {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        });
+
+        const output = parseHookOutput(result.stdout);
+        expect(output).not.toBeNull();
+        // Reports staleness against gitnexus.json's commit, not meta.json's —
+        // proves gitnexus.json is consulted first.
+        expect(output!.additionalContext).toContain('freshco');
+      } finally {
+        fs.rmSync(gitnexusJsonPath, { force: true });
+        fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+      }
+    });
+
+    it(`${label}: falls back to meta.json when gitnexus.json is corrupt`, () => {
+      const gitnexusJsonPath = path.join(gitNexusDir, 'gitnexus.json');
+      const metaJsonPath = path.join(gitNexusDir, 'meta.json');
+      const head = getHeadCommit();
+      fs.writeFileSync(gitnexusJsonPath, 'not valid json!!!');
+      fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: head, stats: {} }));
+
+      try {
+        const result = runHook(hookPath, {
+          hook_event_name: 'PostToolUse',
+          tool_name: 'Bash',
+          tool_input: { command: 'git commit -m "test"' },
+          tool_output: { exit_code: 0 },
+          cwd: tmpDir,
+        });
+
+        // meta.json's lastCommit matches HEAD, so a correct fallback stays silent.
+        expect(result.stdout.trim()).toBe('');
+      } finally {
+        fs.rmSync(gitnexusJsonPath, { force: true });
+        fs.writeFileSync(metaJsonPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+      }
     });
   }
 });
@@ -3001,6 +3191,43 @@ describe('PostToolUse with missing/corrupt meta.json', () => {
 
       // Restore
       fs.writeFileSync(metaPath, JSON.stringify({ lastCommit: 'old', stats: {} }));
+    });
+  }
+});
+
+// ─── Drift guard: every shipped hook must know about gitnexus.json ──
+// This repo has hit the "N mirrored copies silently drift" failure mode
+// twice for skills (#2356/#2360/#2362) — this test is the same class of
+// guardrail for the four hook copies.
+
+describe('Hook metadata-filename drift guard', () => {
+  const ANTIGRAVITY_HOOK = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    'hooks',
+    'antigravity',
+    'gitnexus-antigravity-hook.cjs',
+  );
+  const CURSOR_HOOK = path.resolve(
+    __dirname,
+    '..',
+    '..',
+    '..',
+    'gitnexus-cursor-integration',
+    'hooks',
+    'gitnexus-hook.cjs',
+  );
+
+  for (const [label, hookPath] of [
+    ['CJS (claude)', CJS_HOOK],
+    ['Plugin', PLUGIN_HOOK],
+    ['Antigravity', ANTIGRAVITY_HOOK],
+    ['Cursor', CURSOR_HOOK],
+  ] as const) {
+    it(`${label}: source references gitnexus.json, not only meta.json`, () => {
+      const source = fs.readFileSync(hookPath, 'utf-8');
+      expect(source).toContain('gitnexus.json');
     });
   }
 });

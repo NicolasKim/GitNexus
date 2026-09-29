@@ -31,6 +31,7 @@ const FUNCTION_DECLARATION_TYPES = new Set([
   'function_item',
 ]);
 import type { SyntaxNode } from '../utils/ast-helpers.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
 import type { NodeLabel } from 'gitnexus-shared';
 import type { LanguageProvider } from '../language-provider.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
@@ -397,6 +398,8 @@ export const cProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cVariableConfig),
   classExtractor: cClassExtractor,
+  // ── Doxygen doc comment → description (issue #2270) ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor(),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
 
@@ -427,7 +430,9 @@ export const cProvider = defineLanguage({
 
 export const cppProvider = defineLanguage({
   id: SupportedLanguages.CPlusPlus,
-  extensions: ['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh'],
+  // CUDA files route through tree-sitter-cpp as a conservative C++-subset parser:
+  // definitions still extract, but CUDA launch syntax (`<<< >>>`) is not modeled as calls.
+  extensions: ['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh', '.cu', '.cuh'],
   entryPointPatterns: [
     /^main$/,
     /^init_/,
@@ -480,6 +485,8 @@ export const cppProvider = defineLanguage({
   }),
   variableExtractor: createVariableExtractor(cppVariableConfig),
   classExtractor: cppClassExtractor,
+  // ── Doxygen doc comment → description (issue #2270) ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor(),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
   extractTemplateConstraints: extractCppTemplateConstraintsForProvider,

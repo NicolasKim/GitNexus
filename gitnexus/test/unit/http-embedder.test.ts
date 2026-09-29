@@ -8,8 +8,8 @@ const ENV_KEYS = [
   'GITNEXUS_EMBEDDING_DIMS',
 ] as const;
 
-/** 384d mock vector matching the default schema dimensions. */
-const mockVec = Array.from({ length: 384 }, (_, i) => i / 384);
+/** 1024d mock vector matching this fork's remote embedding default. */
+const mockVec = Array.from({ length: 1024 }, (_, i) => i / 1024);
 
 describe('HTTP embedding backend', () => {
   // Save original env state before any test mutates it
@@ -76,7 +76,7 @@ describe('HTTP embedding backend', () => {
       process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
       process.env.GITNEXUS_EMBEDDING_API_KEY = 'test-key';
 
-      const mockEmbedding = Array.from({ length: 384 }, (_, i) => i * 0.001);
+      const mockEmbedding = Array.from({ length: 1024 }, (_, i) => i * 0.001);
       vi.stubGlobal(
         'fetch',
         vi.fn().mockResolvedValue({
@@ -93,7 +93,7 @@ describe('HTTP embedding backend', () => {
       expect(body.model).toBe('test-model');
       expect(body.input).toEqual(['test text']);
       expect(result).toBeInstanceOf(Float32Array);
-      expect(result.length).toBe(384);
+      expect(result.length).toBe(1024);
     });
 
     it('omits dimensions from request body when GITNEXUS_EMBEDDING_DIMS is unset', async () => {
@@ -249,14 +249,14 @@ describe('HTTP embedding backend', () => {
       });
       vi.stubGlobal(
         'fetch',
-        vi.fn().mockResolvedValueOnce(makeResp(64)).mockResolvedValueOnce(makeResp(6)),
+        vi.fn().mockResolvedValueOnce(makeResp(256)).mockResolvedValueOnce(makeResp(14)),
       );
 
       const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
-      const results = await embedBatch(Array.from({ length: 70 }, (_, i) => `text ${i}`));
+      const results = await embedBatch(Array.from({ length: 270 }, (_, i) => `text ${i}`));
 
       expect(fetch).toHaveBeenCalledTimes(2);
-      expect(results).toHaveLength(70);
+      expect(results).toHaveLength(270);
     });
 
     it('forwards dimensions in every batch when splitting large inputs', async () => {
@@ -271,14 +271,14 @@ describe('HTTP embedding backend', () => {
       });
       vi.stubGlobal(
         'fetch',
-        vi.fn().mockResolvedValueOnce(makeResp(64)).mockResolvedValueOnce(makeResp(6)),
+        vi.fn().mockResolvedValueOnce(makeResp(256)).mockResolvedValueOnce(makeResp(14)),
       );
 
       const { embedBatch } = await import('../../src/core/embeddings/embedder.js');
-      const results = await embedBatch(Array.from({ length: 70 }, (_, i) => `text ${i}`));
+      const results = await embedBatch(Array.from({ length: 270 }, (_, i) => `text ${i}`));
 
       expect(fetch).toHaveBeenCalledTimes(2);
-      expect(results).toHaveLength(70);
+      expect(results).toHaveLength(270);
 
       // Verify dimensions is sent in BOTH batch requests
       const body0 = JSON.parse((fetch as any).mock.calls[0][1].body);

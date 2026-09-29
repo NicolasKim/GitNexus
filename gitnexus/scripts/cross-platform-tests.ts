@@ -36,6 +36,7 @@ const PLATFORM_LOGIC = [
   'test/unit/lbug-pool-fts-load.test.ts',
   'test/unit/repo-manager.test.ts',
   'test/unit/repo-manager-finalize-invariant.test.ts',
+  'test/unit/git-utils.test.ts',
   'test/unit/hooks.test.ts',
   'test/unit/hook-db-lock-probe.test.ts',
   'test/unit/cursor-hook.test.ts',
@@ -46,6 +47,7 @@ const PLATFORM_LOGIC = [
   'test/unit/ignore-service.test.ts',
   'test/unit/group/bridge-db.test.ts',
   'test/unit/group/bridge-db-edge.test.ts',
+  'test/unit/onnxruntime-node-resolver.test.ts',
 ];
 
 // Native LadybugDB integration tests — exercise the @ladybugdb/core
@@ -62,12 +64,19 @@ const LBUG_NATIVE = [
   'test/integration/lbug-orphan-sidecar-recovery.test.ts',
   'test/integration/lbug-readonly-init.test.ts',
   'test/integration/lbug-non-ascii-path.test.ts',
+  // Cross-repo trace e2e: builds two real lbug indexes + a real bridge and
+  // opens them through the pool adapter (native addon + bridge file locking).
+  // Windows is skipped in-file (describeReopen) due to the bridge reopen lock.
+  'test/integration/group/cross-trace-e2e.test.ts',
   'test/integration/local-backend.test.ts',
   'test/integration/local-backend-calltool.test.ts',
   'test/integration/search-core.test.ts',
   'test/integration/search-pool.test.ts',
+  'test/integration/fts-description-search.test.ts',
   'test/integration/staleness-and-stability.test.ts',
   'test/integration/analyze-wal-checkpoint-failure.test.ts',
+  'test/integration/fts-stemmer-sweep.test.ts',
+  'test/integration/lbug-multiwriter-deadlock.test.ts',
 ];
 
 // Process spawning and CLI tests — exercise child_process with real
@@ -75,6 +84,7 @@ const LBUG_NATIVE = [
 // quoting, path resolution, signal handling)
 const SPAWN_CLI = [
   'test/integration/cli-e2e.test.ts',
+  'test/integration/cli-limit-e2e.test.ts',
   'test/integration/hooks-e2e.test.ts',
   'test/integration/skills-e2e.test.ts',
   'test/integration/server-http-startup.test.ts',

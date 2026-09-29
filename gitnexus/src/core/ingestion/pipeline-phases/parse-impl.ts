@@ -40,6 +40,7 @@ import { DEFAULT_PDG_MAX_FUNCTION_LINES } from '../cfg/collect.js';
 import type { WorkerExtractedData } from '../parsing-processor.js';
 import {
   processRoutesFromExtracted,
+  resolveRouteHandlerSymbols,
   buildExportedTypeMapFromGraph,
   type ExportedTypeMap,
 } from '../call-processor.js';
@@ -50,7 +51,14 @@ import {
   SupportedLanguages,
 } from 'gitnexus-shared';
 import { readFileContents } from '../filesystem-walker.js';
-import { isLanguageAvailable, isGrammarRuntimeSkipped } from '../../tree-sitter/parser-loader.js';
+import {
+  isLanguageAvailable,
+  isGrammarRuntimeSkipped,
+  createParserForLanguage,
+} from '../../tree-sitter/parser-loader.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import { getProvider, providers } from '../languages/index.js';
+import type Parser from 'tree-sitter';
 import {
   createWorkerPool,
   workerPoolDisabledByEnv,
@@ -68,10 +76,16 @@ import type {
   FetchWrapperDef,
 } from '../workers/parse-worker.js';
 import type {
+  ExtractedRouterConstructorPrefix,
   ExtractedRouterImport,
   ExtractedRouterInclude,
   ExtractedRouterModuleAlias,
 } from '../route-extractors/fastapi-router-bindings.js';
+import { normalizeExtractedRoutePath } from '../route-extractors/route-path.js';
+import {
+  resolveInheritedSpringRoutes,
+  type SharedSpringType,
+} from '../route-extractors/spring-shared.js';
 import type { KnowledgeGraph } from '../../graph/types.js';
 import type { PipelineOptions } from '../pipeline.js';
 import fs from 'node:fs';
@@ -149,6 +163,122 @@ function resolveChunkByteBudget(options?: PipelineOptions, effectivePoolSize = 1
 
 type ScannedFile = { path: string; size: number };
 type ProgressFn = (progress: PipelineProgress) => void;
+
+/**
+ * Whole-repo, cross-file route extraction (main thread).
+ *
+ * Some frameworks define their route table from a single root file that pulls
+ * in other files across the repo — e.g. Django follows
+ * `manage.py → DJANGO_SETTINGS_MODULE → ROOT_URLCONF → root urls.py`, then walks
+ * `include()` chains across many files. Unlike single-file route files (Laravel
+ * `routes/*.php`), which the parse worker extracts in isolation, these need a
+ * whole-repo view and on-demand cross-file reads — neither of which the
+ * filesystem-free worker can provide, and which a per-chunk worker view gets
+ * wrong whenever the root file and its includes land in different chunks.
+ *
+ * So it runs here, once, after every file is scanned — mirroring the FastAPI
+ * router-include join further below. The pass is language-agnostic: any
+ * {@link LanguageProvider} exposing both `discoverRootRouteFile` and
+ * `extractRoutes` participates (today only Python/Django). For repos without
+ * such a framework the cost is a path scan plus one `manage.py`-style miss.
+ */
+export async function extractCrossFileRoutes(
+  allPaths: string[],
+  repoPath: string,
+): Promise<ExtractedRoute[]> {
+  const out: ExtractedRoute[] = [];
+
+  // Languages whose provider implements the cross-file route hooks. Route
+  // results are intentionally NOT persisted across analyze runs, so a repo
+  // using such a framework (e.g. Django) re-derives its routes on every run;
+  // a repo without one does effectively nothing here. Cross-run route caching
+  // is a deliberate follow-up — see #1836.
+  const routeCapableLangs = new Set<SupportedLanguages>();
+  for (const provider of Object.values(providers)) {
+    if (provider.discoverRootRouteFiles && provider.extractRoutes) {
+      routeCapableLangs.add(provider.id);
+    }
+  }
+  if (routeCapableLangs.size === 0) return out;
+
+  // Bucket only the paths whose language can contribute routes, so a non-
+  // framework repo never pays to bucket the languages it doesn't use here.
+  const pathsByLang = new Map<SupportedLanguages, string[]>();
+  for (const p of allPaths) {
+    const lang = getLanguageFromFilename(p);
+    if (!lang || !routeCapableLangs.has(lang)) continue;
+    let bucket = pathsByLang.get(lang);
+    if (!bucket) {
+      bucket = [];
+      pathsByLang.set(lang, bucket);
+    }
+    bucket.push(p);
+  }
+
+  for (const [lang, langPaths] of pathsByLang) {
+    if (!isLanguageAvailable(lang)) continue;
+    const provider = getProvider(lang);
+    if (!provider.discoverRootRouteFiles || !provider.extractRoutes) continue;
+
+    // Disk-backed reader keyed on repo-relative paths. Discovery and the
+    // include() walk read through this; nothing is pre-loaded, so a repo that
+    // lacks the framework pays only the reads its own discovery probes trigger.
+    const readCache = new Map<string, string | null>();
+    const reader = (relativePath: string): string | null => {
+      const cached = readCache.get(relativePath);
+      if (cached !== undefined) return cached;
+      let content: string | null = null;
+      try {
+        content = fs.readFileSync(path.join(repoPath, relativePath), 'utf-8');
+      } catch {
+        content = null;
+      }
+      readCache.set(relativePath, content);
+      return content;
+    };
+
+    // One root route file per discoverable project (a monorepo can have several).
+    const rootPaths = provider.discoverRootRouteFiles(
+      langPaths.map((p) => ({ path: p })),
+      undefined,
+      reader,
+    );
+    if (rootPaths.length === 0) continue;
+
+    // One parser per language — the grammar is language-scoped, so it is reused
+    // for every project root and every include() re-parse.
+    let parser: Parser;
+    try {
+      parser = await createParserForLanguage(lang, rootPaths[0]);
+    } catch {
+      continue; // grammar unavailable — skip the language, mirrors worker safety net
+    }
+
+    for (const rootPath of rootPaths) {
+      const rootContent = reader(rootPath);
+      if (rootContent === null) continue; // skip this root only, not the language
+
+      let rootTree: Parser.Tree;
+      try {
+        rootTree = parseSourceSafe(parser, rootContent);
+      } catch {
+        logger.warn(`Skipping unparseable root route file: ${rootPath}`);
+        continue; // skip this root only
+      }
+
+      // Isolate a misbehaving provider: a throw here must not abort the whole
+      // analyze (mirrors the worker's per-file isolation). Skip this root, warn.
+      try {
+        const routes = provider.extractRoutes(rootTree, rootPath, reader, parser);
+        for (const r of routes) out.push(r);
+      } catch (err) {
+        logger.warn({ err }, `Cross-file route extraction failed for ${rootPath}`);
+      }
+    }
+  }
+
+  return out;
+}
 
 /**
  * Handle a worker-pool startup failure by FAILING FAST with the captured cause
@@ -247,6 +377,10 @@ export async function runChunkedParseAndResolve(
   allToolDefs: ExtractedToolDef[];
   allORMQueries: ExtractedORMQuery[];
   bindingAccumulator: BindingAccumulator;
+  /** Route URL → resolved handler symbol UID (Part 2, #2138). Lets the routes
+   *  phase stamp `handlerSymbolId` on Route nodes so contract extraction can
+   *  read the handler from the graph instead of re-parsing source. */
+  routeHandlerSymbols: ReadonlyMap<string, string>;
   /** SemanticModel populated during parse — scope-resolution reads its
    *  TypeRegistry / MethodRegistry / SymbolTable indexes. */
   model: MutableSemanticModel;
@@ -491,7 +625,9 @@ export async function runChunkedParseAndResolve(
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   const allRouterIncludes: ExtractedRouterInclude[] = [];
   const allRouterImports: ExtractedRouterImport[] = [];
+  const allRouterConstructorPrefixes: ExtractedRouterConstructorPrefix[] = [];
   const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
+  const allSpringTypes: SharedSpringType[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
   // Aggregated per-file ParsedFile artifacts produced by workers' calls
@@ -646,8 +782,16 @@ export async function runChunkedParseAndResolve(
         if (chunkWorkerData.routerImports?.length) {
           for (const item of chunkWorkerData.routerImports) allRouterImports.push(item);
         }
+        if (chunkWorkerData.routerConstructorPrefixes?.length) {
+          for (const item of chunkWorkerData.routerConstructorPrefixes) {
+            allRouterConstructorPrefixes.push(item);
+          }
+        }
         if (chunkWorkerData.routerModuleAliases?.length) {
           for (const item of chunkWorkerData.routerModuleAliases) allRouterModuleAliases.push(item);
+        }
+        if (chunkWorkerData.springTypes?.length) {
+          for (const item of chunkWorkerData.springTypes) allSpringTypes.push(item);
         }
         if (chunkWorkerData.toolDefs?.length) {
           for (const item of chunkWorkerData.toolDefs) allToolDefs.push(item);
@@ -932,6 +1076,17 @@ export async function runChunkedParseAndResolve(
       for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
       logHeapProbe('post-buildExportedTypeMapFromGraph');
     }
+    // Whole-repo, cross-file route extraction (e.g. Django) runs on the main
+    // thread — the worker has no filesystem access and can't follow `include()`
+    // chains across files. Merge its routes in before `processRoutesFromExtracted`
+    // and the routes phase consume `allExtractedRoutes`.
+    const crossFileRoutes = await extractCrossFileRoutes(allPaths, repoPath);
+    if (crossFileRoutes.length > 0) {
+      for (const r of crossFileRoutes) allExtractedRoutes.push(r);
+      if (deferredProfile) {
+        logDeferredProfile(`cross-file routes: +${crossFileRoutes.length}`);
+      }
+    }
     if (allExtractedRoutes.length > 0) {
       const tRoutes = startTimer(deferredProfile);
       await processRoutesFromExtracted(graph, allExtractedRoutes, model, (current, total) => {
@@ -1009,7 +1164,10 @@ export async function runChunkedParseAndResolve(
   // decorator inherits its file-basename's prefix. When a router is mounted
   // under multiple prefixes we duplicate the route entry, mirroring FastAPI's
   // runtime behaviour.
-  if (allRouterIncludes.length > 0 && allDecoratorRoutes.length > 0) {
+  if (
+    (allRouterIncludes.length > 0 || allRouterConstructorPrefixes.length > 0) &&
+    allDecoratorRoutes.length > 0
+  ) {
     // Group `routerImports` by file so we can resolve Shape-B locals against
     // imports declared in the SAME file as the include_router call. We carry
     // both the short module key (file basename) and, when available, the long
@@ -1054,6 +1212,11 @@ export async function runChunkedParseAndResolve(
     // without a corresponding import statement).
     const prefixesByLongKey = new Map<string, Set<string>>();
     const prefixesByShortKey = new Map<string, Set<string>>();
+    // Constructor prefixes are `router`-only (the apply gate below and the
+    // group-layer tree-sitter both pin to the literal name `router`), so a
+    // flat file-key → prefix map suffices — mirrors the group layer's shape.
+    const constructorPrefixesByLongKey = new Map<string, string>();
+    const constructorPrefixesByShortKey = new Map<string, string>();
 
     const recordPrefix = (target: Map<string, Set<string>>, key: string, prefix: string): void => {
       let set = target.get(key);
@@ -1094,7 +1257,11 @@ export async function runChunkedParseAndResolve(
       }
     }
 
-    if (prefixesByLongKey.size > 0 || prefixesByShortKey.size > 0) {
+    if (
+      prefixesByLongKey.size > 0 ||
+      prefixesByShortKey.size > 0 ||
+      allRouterConstructorPrefixes.length > 0
+    ) {
       const fileLongKey = (rel: string): string => {
         // Strip `.py`, then take the last two path segments. `api/users.py`
         // → `api/users`. Files at the repo root return the empty string,
@@ -1116,6 +1283,15 @@ export async function runChunkedParseAndResolve(
         return file.endsWith('.py') ? file.slice(0, -3) : file;
       };
 
+      for (const ctor of allRouterConstructorPrefixes) {
+        const longKey = fileLongKey(ctor.filePath);
+        if (longKey) {
+          constructorPrefixesByLongKey.set(longKey, ctor.prefix);
+        } else {
+          constructorPrefixesByShortKey.set(fileShortKey(ctor.filePath), ctor.prefix);
+        }
+      }
+
       const expanded: ExtractedDecoratorRoute[] = [];
       for (const dr of allDecoratorRoutes) {
         if (dr.decoratorReceiver !== 'router' || !dr.filePath.endsWith('.py')) {
@@ -1131,12 +1307,24 @@ export async function runChunkedParseAndResolve(
           ? undefined
           : prefixesByShortKey.get(fileShortKey(dr.filePath));
         const prefixes = longPrefixes ?? shortPrefixes;
+        // Constructor prefixes are keyed like include_router prefixes:
+        // long-key entries are precise, while short-key entries are only
+        // valid for repo-root/single-segment files where `fileLongKey`
+        // returns ''. Do not fall back from a missing long-key match to the
+        // short key or a root `users.py` prefix can leak onto
+        // `admin/users.py`.
+        const constructorPrefix = longKey
+          ? constructorPrefixesByLongKey.get(longKey)
+          : constructorPrefixesByShortKey.get(fileShortKey(dr.filePath));
+        const routePath = constructorPrefix
+          ? normalizeExtractedRoutePath(dr.routePath, constructorPrefix)
+          : dr.routePath;
         if (!prefixes || prefixes.size === 0) {
-          expanded.push(dr);
+          expanded.push(routePath === dr.routePath ? dr : { ...dr, routePath });
           continue;
         }
         for (const prefix of prefixes) {
-          expanded.push({ ...dr, prefix });
+          expanded.push({ ...dr, routePath, prefix });
         }
       }
       allDecoratorRoutes.length = 0;
@@ -1144,9 +1332,36 @@ export async function runChunkedParseAndResolve(
     }
   }
 
+  // Cross-file Spring interface-inheritance pass (#2288): a concrete
+  // `@RestController` inherits the `@*Mapping`s declared on the interfaces it
+  // implements. The per-file `SharedSpringType` views collected by the Java
+  // provider's `extractRouteInheritanceTypes` hook are resolved here, project-
+  // wide, into decorator routes attributed to the implementing controller (the
+  // interface's own per-file routes were suppressed at extraction). Mirrors the
+  // group layer via the shared `resolveInheritedSpringRoutes` so both agree.
+  if (allSpringTypes.length > 0) {
+    for (const inherited of resolveInheritedSpringRoutes(allSpringTypes)) {
+      allDecoratorRoutes.push({
+        filePath: inherited.filePath,
+        routePath: inherited.path,
+        httpMethod: inherited.method,
+        decoratorName: 'inherited-mapping',
+        lineNumber: 0,
+        handlerName: inherited.methodName,
+      });
+    }
+  }
+
   logHeapProbe(
     'parse-impl-return',
     `exportedTypeMap=${exportedTypeMap.size} parsedFiles=${allParsedFiles.length} nodes=${graph.nodeCount}`,
+  );
+  // Part 2 (#2138): resolve each route's handler to a real symbol UID now that
+  // the model is fully populated and decorator-route prefixes are finalized.
+  const routeHandlerSymbols = resolveRouteHandlerSymbols(
+    model,
+    allExtractedRoutes,
+    allDecoratorRoutes,
   );
   return {
     exportedTypeMap,
@@ -1157,6 +1372,7 @@ export async function runChunkedParseAndResolve(
     allToolDefs,
     allORMQueries,
     bindingAccumulator,
+    routeHandlerSymbols,
     model,
     // Whether a worker pool was actually constructed for this run. False means
     // no pool was needed: a warm all-cache-hit run replays cached worker output
