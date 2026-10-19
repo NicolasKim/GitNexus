@@ -1027,3 +1027,52 @@ describe('HTTP mode config probe (#2385)', () => {
     expect(isHttpEmbeddingError(err)).toBe(false);
   });
 });
+
+describe('HTTP embedding 4xx body diagnostics (foruver)', () => {
+  const ENV_KEYS = [
+    'GITNEXUS_EMBEDDING_URL',
+    'GITNEXUS_EMBEDDING_MODEL',
+    'GITNEXUS_EMBEDDING_API_KEY',
+    'GITNEXUS_EMBEDDING_DIMS',
+  ] as const;
+  const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.resetModules();
+    for (const key of ENV_KEYS) {
+      if (savedEnv[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = savedEnv[key];
+      }
+    }
+  });
+
+  it('should include response body snippet when embedding endpoint returns 400', async () => {
+    // Arrange
+    process.env.GITNEXUS_EMBEDDING_URL = 'http://test:8080/v1';
+    process.env.GITNEXUS_EMBEDDING_MODEL = 'test-model';
+    const bodyText = '{"error":"input too long for voyage batch"}';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        text: async () => bodyText,
+        json: async () => {
+          throw new Error('body should be read via text() for 4xx');
+        },
+      }),
+    );
+
+    // Act
+    const { httpEmbed } = await import('../../src/core/embeddings/http-client.js');
+    const err = await httpEmbed(['hello']).catch((e: unknown) => e);
+
+    // Assert
+    expect(err).toBeInstanceOf(Error);
+    expect(String(err)).toContain('400');
+    expect(String(err)).toContain('input too long for voyage batch');
+  });
+});

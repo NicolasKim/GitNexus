@@ -587,9 +587,25 @@ const httpEmbedBatch = async (
 
   if (!resp.ok) {
     // resilientFetch already retried 5xx/429; any non-OK response here is
-    // a terminal client error (4xx other than 429).
+    // a terminal client error (4xx other than 429). Capture the response
+    // body so we can diagnose input-validation errors (e.g. Voyage 400 on
+    // an empty or oversized text in a batch). Non-OK bodies are not read
+    // inside fetchImpl, so the stream is still available here.
+    let errorBody = '';
+    try {
+      errorBody = await resp.text();
+    } catch {
+      // Secondary read errors are not fatal; keep the original status-focused
+      // error if the body cannot be read.
+    }
+    if (errorBody) {
+      console.error(
+        `Embedding endpoint ${resp.status} body (${safeUrl(url)}, batch ${batchIndex}): ${errorBody.slice(0, 2000)}`,
+      );
+    }
+    const bodyHint = errorBody ? `: ${errorBody.slice(0, 500)}` : '';
     throw new HttpEmbeddingError(
-      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})`,
+      `Embedding endpoint returned ${resp.status} (${safeUrl(url)}, batch ${batchIndex})${bodyHint}`,
     );
   }
 

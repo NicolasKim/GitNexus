@@ -5,6 +5,7 @@ type GitNexusTool = (typeof GITNEXUS_TOOLS)[number];
 export const MCP_READ_ONLY_TOOLS = new Set([
   'list_repos',
   'query',
+  'cypher',
   'context',
   'read_file',
   'grep',
@@ -85,8 +86,8 @@ export function filterMcpReadOnlyResourceContent(content: string, readOnly: bool
     .split('\n')
     .filter(
       (line) =>
-        !/^\s*-\s+(?:rename|cypher|group_sync|group_list):/u.test(line) &&
-        !/^\|\s*`(?:rename|cypher|group_sync|group_list)`\s*\|/u.test(line) &&
+        !/^\s*-\s+(?:rename|group_sync|group_list):/u.test(line) &&
+        !/^\|\s*`(?:rename|group_sync|group_list)`\s*\|/u.test(line) &&
         !line.includes('gitnexus://group/'),
     )
     .join('\n');
@@ -117,7 +118,7 @@ export function toolForReadOnlyMcp(tool: GitNexusTool, readOnly: boolean): GitNe
 
   return {
     ...tool,
-    description: `${scrubGroupDescription(tool.description)}\n\nGitNexus MCP read-only mode excludes raw Cypher, mutation, and group routing.`,
+    description: `${scrubGroupDescription(tool.description)}\n\nGitNexus MCP read-only mode excludes mutation and group routing.`,
     inputSchema: { ...tool.inputSchema, properties },
   };
 }

@@ -22,7 +22,7 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import os from 'node:os';
-import { createRouteLimiter } from '../../src/server/validation.js';
+import { createRouteLimiter, FILE_API_RATE_LIMIT_RPM } from '../../src/server/validation.js';
 import {
   DEFAULT_TRUST_PROXY,
   TRUST_PROXY_ENV,
@@ -72,6 +72,11 @@ const stopServer = (server: http.Server): Promise<void> =>
   new Promise((resolve) => server.close(() => resolve()));
 
 describe('createRouteLimiter — defaults', () => {
+  it('exposes FILE_API_RATE_LIMIT_RPM at 120 for agent parallel file reads (foruver)', () => {
+    // Arrange / Assert — /api/file must allow higher burst than the default 60 rpm.
+    expect(FILE_API_RATE_LIMIT_RPM).toBe(120);
+  });
+
   it('returns a different middleware instance per call (independent counters)', () => {
     const a = createRouteLimiter();
     const b = createRouteLimiter();

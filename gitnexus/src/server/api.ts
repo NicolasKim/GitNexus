@@ -80,7 +80,12 @@ import {
   persistedEmbeddingCountOrUndefined,
   type PersistedEmbeddingCount,
 } from '../core/embedding-count.js';
-import { assertString, BadRequestError, createRouteLimiter } from './validation.js';
+import {
+  assertString,
+  BadRequestError,
+  createRouteLimiter,
+  FILE_API_RATE_LIMIT_RPM,
+} from './validation.js';
 import { parseGrepQuery, GREP_TIME_BUDGET_MS } from './grep-params.js';
 import { runGrepScanInWorker } from './grep-scan.js';
 import {
@@ -1663,7 +1668,8 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Read file — with path traversal guard
   // Rate-limited (CodeQL js/missing-rate-limiting): per-request fs.readFile.
-  app.get('/api/file', createRouteLimiter(), async (req, res) => {
+  // Higher RPM than default: agent pipelines may burst parallel file reads.
+  app.get('/api/file', createRouteLimiter({ limit: FILE_API_RATE_LIMIT_RPM }), async (req, res) => {
     try {
       const entry = await resolveRepo(requestedRepo(req));
       if (!entry) {

@@ -8,6 +8,7 @@ const READ_ONLY_TOOLS = [
   'api_impact',
   'check',
   'context',
+  'cypher',
   'detect_changes',
   'explain',
   'grep',
@@ -104,24 +105,23 @@ describe('MCP read-only mode', () => {
     },
   );
 
-  it.each(['CREATE (n:Injected)', 'MATCH (n) DETACH DELETE n', 'DROP TABLE Node'])(
-    'rejects raw cypher before backend dispatch: %s',
-    async (statement) => {
-      enableReadOnly();
-      const session = await connect();
-      try {
-        const response = await session.client.callTool({
-          name: 'cypher',
-          arguments: { repo: 'test', statement },
-        });
-        expect(response.isError).toBe(true);
-        expect((response.content[0] as { text: string }).text).toMatch(/read-only mode/i);
-        expect(session.backend.callTool).not.toHaveBeenCalled();
-      } finally {
-        await session.close();
-      }
-    },
-  );
+  it('should dispatch read-only cypher MATCH queries to the backend', async () => {
+    enableReadOnly();
+    const session = await connect();
+    try {
+      const response = await session.client.callTool({
+        name: 'cypher',
+        arguments: { repo: 'test', statement: 'MATCH (n) RETURN n LIMIT 1' },
+      });
+      expect(response.isError).not.toBe(true);
+      expect(session.backend.callTool).toHaveBeenCalledWith('cypher', {
+        repo: 'test',
+        statement: 'MATCH (n) RETURN n LIMIT 1',
+      });
+    } finally {
+      await session.close();
+    }
+  });
 
   it.each(['query', 'context', 'impact', 'trace'])(
     'rejects @group routing through %s before backend dispatch',
@@ -237,7 +237,7 @@ describe('MCP read-only mode', () => {
       for (const uri of ['gitnexus://setup', 'gitnexus://repo/test/context']) {
         const resource = await session.client.readResource({ uri });
         const text = (resource.contents[0] as { text: string }).text;
-        expect(text).not.toMatch(/(?:^\s*-\s+|^\|\s*`)(?:rename|cypher)/mu);
+        expect(text).not.toMatch(/(?:^\s*-\s+|^\|\s*`)(?:rename|group_sync|group_list)/mu);
         expect(text).not.toContain('gitnexus://group/');
       }
     } finally {
